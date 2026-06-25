@@ -1,0 +1,31 @@
+{
+  "name": "knowledge_search_tool",
+  "kind": "function",
+  "description": "Search the LangChain-backed knowledge base for non-structured content such as FAQ, comments, guides, rules, and long-form notes. Use this when the answer depends on text evidence rather than only shop filters.",
+  "executor": "app.agent.tools.builtin.executors.knowledge_search:execute",
+  "argument_preparer": "app.agent.tools.builtin.executors.knowledge_search:prepare_arguments",
+  "capabilities": ["builtin", "read_only", "rag", "search"],
+  "metadata": {
+    "tool_function": "app.agent.tools.builtin.executors.knowledge_search:execute"
+  },
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Natural-language knowledge query, for example `这家店评论怎么样` or `maimai 新手入门`.",
+        "title": "Query"
+      },
+      "top_k": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 8,
+        "default": 4,
+        "title": "Top K"
+      }
+    },
+    "required": ["query"],
+    "title": "KnowledgeSearchArgs",
+    "type": "object"
+  }
+}

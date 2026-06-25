@@ -96,6 +96,21 @@ class Settings:
     llm_timeout_seconds: float = 20.0
     llm_temperature: float = 0.2
     llm_max_tokens: int = 500
+    rag_enabled: bool = False
+    rag_source_path: Path = Path("data/local/knowledge")
+    rag_chunk_size: int = 700
+    rag_chunk_overlap: int = 120
+    rag_top_k: int = 4
+    rag_embedding_api_key: str = ""
+    rag_embedding_base_url: str = ""
+    rag_embedding_model: str = ""
+    rag_embedding_timeout_seconds: float = 20.0
+    rag_reranker_enabled: bool = False
+    rag_reranker_model: str = ""
+    rag_reranker_top_k_multiplier: int = 5
+    rag_reranker_timeout_seconds: float = 20.0
+    rag_hybrid_search_enabled: bool = False
+    rag_hybrid_alpha: float = 0.5
     agent_max_steps: int = 20
     agent_context_window: int = 24
     agent_nodes_definitions_dir: Path = Path("app/agent/nodes/definitions")
@@ -163,6 +178,30 @@ class Settings:
             llm_max_tokens=int(
                 os.getenv("LLM_MAX_TOKENS", str(cls.llm_max_tokens))
             ),
+            rag_enabled=_env_bool("RAG_ENABLED", cls.rag_enabled),
+            rag_source_path=_resolve_path(os.getenv("RAG_SOURCE_PATH", str(cls.rag_source_path))),
+            rag_chunk_size=int(os.getenv("RAG_CHUNK_SIZE", str(cls.rag_chunk_size))),
+            rag_chunk_overlap=int(os.getenv("RAG_CHUNK_OVERLAP", str(cls.rag_chunk_overlap))),
+            rag_top_k=int(os.getenv("RAG_TOP_K", str(cls.rag_top_k))),
+            rag_embedding_api_key=os.getenv("RAG_EMBEDDING_API_KEY", cls.rag_embedding_api_key),
+            rag_embedding_base_url=os.getenv("RAG_EMBEDDING_BASE_URL", cls.rag_embedding_base_url),
+            rag_embedding_model=os.getenv("RAG_EMBEDDING_MODEL", cls.rag_embedding_model),
+            rag_embedding_timeout_seconds=float(
+                os.getenv(
+                    "RAG_EMBEDDING_TIMEOUT_SECONDS",
+                    str(cls.rag_embedding_timeout_seconds),
+                )
+            ),
+            rag_reranker_enabled=_env_bool("RAG_RERANKER_ENABLED", cls.rag_reranker_enabled),
+            rag_reranker_model=os.getenv("RAG_RERANKER_MODEL", cls.rag_reranker_model),
+            rag_reranker_top_k_multiplier=int(
+                os.getenv("RAG_RERANKER_TOP_K_MULTIPLIER", str(cls.rag_reranker_top_k_multiplier))
+            ),
+            rag_reranker_timeout_seconds=float(
+                os.getenv("RAG_RERANKER_TIMEOUT_SECONDS", str(cls.rag_reranker_timeout_seconds))
+            ),
+            rag_hybrid_search_enabled=_env_bool("RAG_HYBRID_SEARCH_ENABLED", cls.rag_hybrid_search_enabled),
+            rag_hybrid_alpha=float(os.getenv("RAG_HYBRID_ALPHA", str(cls.rag_hybrid_alpha))),
             agent_max_steps=int(
                 os.getenv("AGENT_MAX_STEPS", str(cls.agent_max_steps))
             ),
