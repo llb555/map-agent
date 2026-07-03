@@ -217,7 +217,7 @@ class ProviderAdapter:
         payload: dict[str, Any] = {
             "model": self._config.model,
             "instructions": instructions,
-            "input": messages,
+            "input": self._to_responses_input(messages),
             "temperature": self._config.temperature,
             "max_output_tokens": self._config.max_tokens,
             "tool_choice": tool_choice,
@@ -290,6 +290,38 @@ class ProviderAdapter:
                 payload["strict"] = function.get("strict")
             return payload
         return tool
+
+    def _to_responses_input(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        converted: list[dict[str, Any]] = []
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            if role not in {"user", "assistant", "system", "tool"}:
+                continue
+            content = item.get("content")
+            multimodal = self._normalize_chat_content(content)
+            if multimodal is None:
+                text = content if isinstance(content, str) else str(content or "")
+                converted.append({"role": role, "content": text})
+                continue
+
+            parts: list[dict[str, Any]] = []
+            for block in multimodal:
+                if block["type"] == "text":
+                    parts.append({"type": "input_text", "text": block["text"]})
+                    continue
+                image_url = block.get("image_url")
+                if isinstance(image_url, dict):
+                    url = str(image_url.get("url") or "").strip()
+                    if url:
+                        part: dict[str, Any] = {"type": "input_image", "image_url": url}
+                        detail = str(image_url.get("detail") or "").strip()
+                        if detail:
+                            part["detail"] = detail
+                        parts.append(part)
+            converted.append({"role": role, "content": parts or [{"type": "input_text", "text": ""}]})
+        return converted
 
     def _parse_responses_tool_call(self, payload: dict[str, Any]) -> ModelToolCall | None:
         name = payload.get("name")
@@ -438,6 +470,10 @@ class ProviderAdapter:
             if role not in {"user", "assistant", "system"}:
                 continue
             content = item.get("content")
+            multimodal = self._normalize_chat_content(content)
+            if multimodal is not None:
+                normalized.append({"role": role, "content": multimodal})
+                continue
             if content is None:
                 text = ""
             elif isinstance(content, str):
@@ -446,6 +482,34 @@ class ProviderAdapter:
                 text = str(content)
             normalized.append({"role": role, "content": text})
         return normalized
+
+    def _normalize_chat_content(self, raw_content: Any) -> list[dict[str, Any]] | None:
+        if not isinstance(raw_content, list):
+            return None
+        normalized: list[dict[str, Any]] = []
+        for item in raw_content:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").strip()
+            if item_type in {"text", "output_text"}:
+                text = str(item.get("text") or item.get("value") or "").strip()
+                if text:
+                    normalized.append({"type": "text", "text": text})
+                continue
+            if item_type != "image_url":
+                continue
+            image_url = item.get("image_url")
+            if not isinstance(image_url, dict):
+                continue
+            url = str(image_url.get("url") or "").strip()
+            if not url:
+                continue
+            payload = {"url": url}
+            detail = str(image_url.get("detail") or "").strip()
+            if detail:
+                payload["detail"] = detail
+            normalized.append({"type": "image_url", "image_url": payload})
+        return normalized or None
 
     def _extract_chat_text(self, raw_content: Any) -> str | None:
         if isinstance(raw_content, str):
@@ -590,10 +654,25 @@ class ProviderAdapter:
             if not isinstance(item, dict):
                 continue
             role = str(item.get("role") or "-")
-            content = item.get("content")
-            content_text = content if isinstance(content, str) else str(content)
-            rows.append(f"{role}:{self._short(content_text, limit=60)}")
+            rows.append(f"{role}:{self._content_preview(item.get('content'), limit=60)}")
         return rows
+
+    def _content_preview(self, content: Any, *, limit: int) -> str:
+        if isinstance(content, str):
+            return self._short(content, limit=limit)
+        multimodal = self._normalize_chat_content(content)
+        if multimodal is None:
+            return self._short(str(content), limit=limit)
+        parts: list[str] = []
+        image_count = 0
+        for item in multimodal:
+            if item["type"] == "text":
+                parts.append(str(item.get("text") or ""))
+            elif item["type"] == "image_url":
+                image_count += 1
+        if image_count:
+            parts.append(f"[images:{image_count}]")
+        return self._short(" ".join(part for part in parts if part).strip(), limit=limit)
 
     def _short(self, value: str | None, *, limit: int = 120) -> str:
         if not isinstance(value, str):

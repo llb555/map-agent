@@ -7,8 +7,9 @@ from pathlib import Path
 
 from app.agent.context.context_builder import ContextBuilder
 from app.agent.events.replay_buffer import ReplayBuffer
-from app.agent.llm.llm_config import resolve_llm_config
+from app.agent.llm.llm_config import resolve_llm_config, resolve_vision_llm_config
 from app.agent.llm.provider_adapter import ProviderAdapter
+from app.agent.llm.provider_router import ProviderRouter
 from app.agent.runtime.react_runtime import ReactRuntime
 from app.agent.runtime.session_state import SessionStateStore
 from app.agent.subagents.subagent_builder import SubAgentBuilder
@@ -21,9 +22,12 @@ from app.core.config import Settings
 from app.infra.db.local_store import LocalArcadeStore
 from app.infra.db.repository import ArcadeRepository
 from app.infra.db.supabase_repository import SupabaseArcadeRepository, SupabaseRepositoryConfig
+from app.rag.service import LangChainRAGService
 from app.services.arcade_geo_resolver import ArcadeGeoResolver, ArcadeGeoResolverConfig
 from app.services.arcade_payload_mapper import ArcadePayloadMapper
 from app.services.amap_reverse_geocoder import AMapReverseGeocoder, AMapReverseGeocoderConfig
+from app.services.region_catalog import AMapRegionCatalog, AMapRegionCatalogConfig
+from app.services.region_service import RegionService
 
 
 @dataclass
@@ -37,6 +41,8 @@ class AppContainer:
     reverse_geocoder: AMapReverseGeocoder
     arcade_geo_resolver: ArcadeGeoResolver
     arcade_payload_mapper: ArcadePayloadMapper
+    region_service: RegionService
+    rag_service: LangChainRAGService
     tool_registry: ToolRegistry
     react_runtime: ReactRuntime
     orchestrator: Orchestrator
@@ -47,6 +53,12 @@ def build_container(settings: Settings) -> AppContainer:
     store = _build_arcade_repository(settings)
     replay_buffer = ReplayBuffer(max_events_per_session=settings.replay_buffer_size)
     provider_adapter = ProviderAdapter(resolve_llm_config(settings))
+    vision_config = resolve_vision_llm_config(settings)
+    vision_provider_adapter = ProviderAdapter(vision_config) if vision_config is not None else None
+    provider_router = ProviderRouter(
+        primary=provider_adapter,
+        vision=vision_provider_adapter,
+    )
     reverse_geocoder = AMapReverseGeocoder(
         config=AMapReverseGeocoderConfig(
             api_key=settings.amap_api_key,
@@ -65,7 +77,19 @@ def build_container(settings: Settings) -> AppContainer:
         )
     )
     arcade_payload_mapper = ArcadePayloadMapper(geo_resolver=arcade_geo_resolver)
+    region_catalog = AMapRegionCatalog(
+        AMapRegionCatalogConfig(
+            api_key=settings.amap_api_key,
+            base_url=settings.amap_base_url,
+            timeout_seconds=settings.amap_timeout_seconds,
+        )
+    )
+    region_service = RegionService(store=store, catalog=region_catalog)
     project_root = Path(__file__).resolve().parents[1]
+    rag_service = LangChainRAGService(
+        settings=settings,
+        project_root=project_root,
+    )
     context_builder = ContextBuilder(
         prompt_root=project_root / "agent" / "context" / "prompts",
         skill_root=project_root / "agent" / "context" / "skills",
@@ -88,7 +112,9 @@ def build_container(settings: Settings) -> AppContainer:
             "store": store,
             "settings": settings,
             "mcp_tool_gateway": mcp_tool_gateway,
+            "arcade_geo_resolver": arcade_geo_resolver,
             "project_root": project_root,
+            "knowledge_rag_service": rag_service,
         }
     )
     tool_registry = ToolRegistry(
@@ -101,7 +127,7 @@ def build_container(settings: Settings) -> AppContainer:
         context_builder=context_builder,
         subagent_builder=subagent_builder,
         tool_registry=tool_registry,
-        provider_adapter=provider_adapter,
+        provider_adapter=provider_router,
         session_store=session_store,
         replay_buffer=replay_buffer,
         arcade_payload_mapper=arcade_payload_mapper,
@@ -118,6 +144,8 @@ def build_container(settings: Settings) -> AppContainer:
         reverse_geocoder=reverse_geocoder,
         arcade_geo_resolver=arcade_geo_resolver,
         arcade_payload_mapper=arcade_payload_mapper,
+        region_service=region_service,
+        rag_service=rag_service,
         tool_registry=tool_registry,
         react_runtime=react_runtime,
         orchestrator=orchestrator,

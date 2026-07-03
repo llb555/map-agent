@@ -96,15 +96,25 @@ class Settings:
     llm_timeout_seconds: float = 20.0
     llm_temperature: float = 0.2
     llm_max_tokens: int = 500
+    vision_llm_api_key: str = ""
+    vision_llm_base_url: str = ""
+    vision_llm_model: str = ""
+    vision_llm_timeout_seconds: float = 20.0
+    vision_llm_temperature: float = 0.2
+    vision_llm_max_tokens: int = 700
     rag_enabled: bool = False
     rag_source_path: Path = Path("data/local/knowledge")
     rag_chunk_size: int = 700
     rag_chunk_overlap: int = 120
+    rag_semantic_chunking_enabled: bool = False
     rag_top_k: int = 4
     rag_embedding_api_key: str = ""
     rag_embedding_base_url: str = ""
     rag_embedding_model: str = ""
     rag_embedding_timeout_seconds: float = 20.0
+    rag_vector_backend: Literal["memory", "faiss"] = "memory"
+    rag_faiss_index_path: Path = Path("data/runtime/rag_index.faiss")
+    rag_faiss_metadata_path: Path = Path("data/runtime/rag_index_meta.json")
     rag_reranker_enabled: bool = False
     rag_reranker_model: str = ""
     rag_reranker_top_k_multiplier: int = 5
@@ -135,6 +145,9 @@ class Settings:
         arcade_data_source = os.getenv("ARCADE_DATA_SOURCE", cls.arcade_data_source).strip().lower()
         if arcade_data_source not in {"jsonl", "supabase"}:
             raise ValueError(f"invalid_arcade_data_source:{arcade_data_source}")
+        rag_vector_backend = os.getenv("RAG_VECTOR_BACKEND", cls.rag_vector_backend).strip().lower()
+        if rag_vector_backend not in {"memory", "faiss"}:
+            raise ValueError(f"invalid_rag_vector_backend:{rag_vector_backend}")
         return cls(
             app_name=os.getenv("APP_NAME", cls.app_name),
             app_version=os.getenv("APP_VERSION", cls.app_version),
@@ -178,10 +191,26 @@ class Settings:
             llm_max_tokens=int(
                 os.getenv("LLM_MAX_TOKENS", str(cls.llm_max_tokens))
             ),
+            vision_llm_api_key=os.getenv("VISION_LLM_API_KEY", cls.vision_llm_api_key),
+            vision_llm_base_url=os.getenv("VISION_LLM_BASE_URL", cls.vision_llm_base_url),
+            vision_llm_model=os.getenv("VISION_LLM_MODEL", cls.vision_llm_model),
+            vision_llm_timeout_seconds=float(
+                os.getenv("VISION_LLM_TIMEOUT_SECONDS", str(cls.vision_llm_timeout_seconds))
+            ),
+            vision_llm_temperature=float(
+                os.getenv("VISION_LLM_TEMPERATURE", str(cls.vision_llm_temperature))
+            ),
+            vision_llm_max_tokens=int(
+                os.getenv("VISION_LLM_MAX_TOKENS", str(cls.vision_llm_max_tokens))
+            ),
             rag_enabled=_env_bool("RAG_ENABLED", cls.rag_enabled),
             rag_source_path=_resolve_path(os.getenv("RAG_SOURCE_PATH", str(cls.rag_source_path))),
             rag_chunk_size=int(os.getenv("RAG_CHUNK_SIZE", str(cls.rag_chunk_size))),
             rag_chunk_overlap=int(os.getenv("RAG_CHUNK_OVERLAP", str(cls.rag_chunk_overlap))),
+            rag_semantic_chunking_enabled=_env_bool(
+                "RAG_SEMANTIC_CHUNKING_ENABLED",
+                cls.rag_semantic_chunking_enabled,
+            ),
             rag_top_k=int(os.getenv("RAG_TOP_K", str(cls.rag_top_k))),
             rag_embedding_api_key=os.getenv("RAG_EMBEDDING_API_KEY", cls.rag_embedding_api_key),
             rag_embedding_base_url=os.getenv("RAG_EMBEDDING_BASE_URL", cls.rag_embedding_base_url),
@@ -191,6 +220,13 @@ class Settings:
                     "RAG_EMBEDDING_TIMEOUT_SECONDS",
                     str(cls.rag_embedding_timeout_seconds),
                 )
+            ),
+            rag_vector_backend=rag_vector_backend,  # type: ignore[arg-type]
+            rag_faiss_index_path=_resolve_project_path(
+                os.getenv("RAG_FAISS_INDEX_PATH", str(cls.rag_faiss_index_path))
+            ),
+            rag_faiss_metadata_path=_resolve_project_path(
+                os.getenv("RAG_FAISS_METADATA_PATH", str(cls.rag_faiss_metadata_path))
             ),
             rag_reranker_enabled=_env_bool("RAG_RERANKER_ENABLED", cls.rag_reranker_enabled),
             rag_reranker_model=os.getenv("RAG_RERANKER_MODEL", cls.rag_reranker_model),

@@ -16,6 +16,8 @@ from app.agent.context.context_payload import (
     RuntimeContextPayloadDto,
     SearchCatalogContextDto,
     SearchCatalogShopDto,
+    KnowledgeHitContextDto,
+    KnowledgeHitsContextDto,
     ShopArcadeContextDto,
     ShopBasicContextDto,
     ShopCommentContextDto,
@@ -65,6 +67,7 @@ class ContextBuilder:
         skill_block = self._build_skill_block(subagent.skill_files)
         client_location = self._client_location_payload(session_state=session_state, request=request)
         client_location_block = self._build_client_location_block(client_location)
+        attachment_block = self._build_attachment_block(request)
         context_payload = self._build_context_payload(
             session_state=session_state,
             request=request,
@@ -110,6 +113,7 @@ class ContextBuilder:
             (
                 subagent_prompt,
                 client_location_block,
+                attachment_block,
                 "Runtime state (JSON):",
                 json.dumps(runtime_hint, ensure_ascii=False),
             )
@@ -232,9 +236,13 @@ class ContextBuilder:
         其中，tool角色的消息会额外包含工具调用的结果摘要（如果有），
         以便模型参考最近的工具输出进行决策。用户和助手消息则直接反映对话内容。
         """
+        scoped_turns = self._tail_turns(session_state.turns, scope=turn_scope)
         messages = [
-            self._to_model_message(turn)
-            for turn in self._tail_turns(session_state.turns, scope=turn_scope)
+            self._to_model_message(
+                turn,
+                request=request if turn_scope == "conversation" and index == len(scoped_turns) - 1 else None,
+            )
+            for index, turn in enumerate(scoped_turns)
         ]
         return BuiltContext(instructions=instructions, messages=messages)
 
@@ -287,13 +295,33 @@ class ContextBuilder:
         )
         return "\n".join(lines)
 
+    def _build_attachment_block(self, request: ChatRequest) -> str:
+        if not request.attachments:
+            return ""
+        lines = [
+            "Attachment context:",
+            "Treat uploaded files and images as part of the current user request.",
+        ]
+        for index, attachment in enumerate(request.attachments, start=1):
+            lines.append(
+                f"- Attachment {index}: name={attachment.name}, kind={attachment.kind}, mime_type={attachment.mime_type}, size_bytes={attachment.size_bytes}"
+            )
+            if attachment.preview_text:
+                lines.append(f"  preview: {attachment.preview_text}")
+            if attachment.extracted_text:
+                lines.append(f"  extracted_text: {attachment.extracted_text}")
+            if attachment.kind == "image":
+                lines.append("  note: image attached; when image bytes are available on the current turn, inspect the image content directly.")
+        lines.append("- Use attachment facts directly when they improve the answer or the next tool choice.")
+        return "\n".join(lines)
+
     def _tail_turns(self, turns: list[AgentTurn], *, scope: str) -> list[AgentTurn]:
         scoped_turns = [turn for turn in turns if turn.scope == scope]
         if len(scoped_turns) <= self._history_turn_limit:
             return scoped_turns
         return scoped_turns[-self._history_turn_limit :]
 
-    def _to_model_message(self, turn: AgentTurn) -> dict[str, Any]:
+    def _to_model_message(self, turn: AgentTurn, request: ChatRequest | None = None) -> dict[str, Any]:
         if turn.role == "tool":
             payload: dict[str, Any] = {
                 "role": "tool",
@@ -304,7 +332,30 @@ class ContextBuilder:
             if turn.call_id:
                 payload["tool_call_id"] = turn.call_id
             return payload
-        return {"role": turn.role, "content": turn.content}
+        content: Any = turn.content
+        if turn.role == "user" and request is not None:
+            content = self._build_user_message_content(turn.content, request)
+        return {"role": turn.role, "content": content}
+
+    def _build_user_message_content(self, text: str, request: ChatRequest) -> str | list[dict[str, Any]]:
+        image_parts: list[dict[str, Any]] = []
+        for attachment in request.attachments:
+            if attachment.kind != "image" or not attachment.image_data_url:
+                continue
+            image_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": attachment.image_data_url},
+                }
+            )
+        if not image_parts:
+            return text
+
+        prompt_text = text.strip() or "请查看我上传的图片并回答。"
+        return [
+            {"type": "text", "text": prompt_text},
+            *image_parts,
+        ]
 
     def _build_skill_block(self, skill_files: list[str]) -> str:
         sections: list[str] = []
@@ -326,6 +377,7 @@ class ContextBuilder:
     ) -> RuntimeContextPayloadDto:
         query = self._build_query_context(session_state=session_state, request=request)
         search_catalog = self._build_search_catalog(session_state=session_state)
+        knowledge_hits = self._build_knowledge_hits(session_state=session_state)
         shop_details = self._build_shop_details(session_state=session_state)
         route = self._build_route_context(session_state=session_state)
         directory = self._build_directory(
@@ -333,6 +385,7 @@ class ContextBuilder:
             subagent=subagent,
             query=query,
             search_catalog=search_catalog,
+            knowledge_hits=knowledge_hits,
             shop_details=shop_details,
             route=route,
         )
@@ -340,6 +393,7 @@ class ContextBuilder:
             directory=directory,
             query=query,
             search_catalog=search_catalog,
+            knowledge_hits=knowledge_hits,
             shop_details=shop_details,
             route=route,
         )
@@ -351,6 +405,7 @@ class ContextBuilder:
         subagent: SubAgentProfile,
         query: QueryContextDto | None,
         search_catalog: SearchCatalogContextDto | None,
+        knowledge_hits: KnowledgeHitsContextDto | None,
         shop_details: list[ShopDetailContextDto],
         route: RouteContextDto | None,
     ) -> ContextDirectoryDto:
@@ -384,6 +439,15 @@ class ContextBuilder:
                 )
             )
             reading_order.append("query")
+        if knowledge_hits is not None:
+            available_blocks.append(
+                ContextBlockRefDto(
+                    block="knowledge_hits",
+                    purpose="Retrieved textual evidence from the LangChain knowledge base.",
+                    primary_fields=["query", "hits"],
+                )
+            )
+            reading_order.append("knowledge_hits")
         if shop_details:
             available_blocks.append(
                 ContextBlockRefDto(
@@ -396,10 +460,10 @@ class ContextBuilder:
 
         # Keep detail blocks after primary catalog/route blocks unless route is the only answer anchor.
         if route is not None and "shop_details" in reading_order:
-            reading_order = ["route", "search_catalog", "query", "shop_details"]
+            reading_order = ["route", "search_catalog", "query", "knowledge_hits", "shop_details"]
             reading_order = [item for item in reading_order if item in {block.block for block in available_blocks}]
         elif search_catalog is not None and "shop_details" in reading_order:
-            reading_order = ["search_catalog", "query", "shop_details"]
+            reading_order = ["search_catalog", "query", "knowledge_hits", "shop_details"]
             reading_order = [item for item in reading_order if item in {block.block for block in available_blocks}]
 
         return ContextDirectoryDto(
@@ -407,7 +471,11 @@ class ContextBuilder:
             active_subagent=subagent.name,
             available_blocks=available_blocks,
             reading_order=reading_order,
-            focus=self._build_focus_text(search_catalog=search_catalog, route=route),
+            focus=self._build_focus_text(
+                search_catalog=search_catalog,
+                knowledge_hits=knowledge_hits,
+                route=route,
+            ),
             top_shop_ids=[
                 int(item.source_id)
                 for item in (search_catalog.top_shops if search_catalog is not None else [])
@@ -419,11 +487,14 @@ class ContextBuilder:
         self,
         *,
         search_catalog: SearchCatalogContextDto | None,
+        knowledge_hits: KnowledgeHitsContextDto | None,
         route: RouteContextDto | None,
     ) -> str:
         if route is not None:
             return "Use route as the main answer. Add destination detail only when it improves the reply."
         total = search_catalog.total if search_catalog is not None else None
+        if knowledge_hits is not None and knowledge_hits.hits:
+            return "Answer from retrieved knowledge snippets first. Add structured shop detail only when it clearly helps."
         if isinstance(total, int) and total <= 0:
             return "State that no shop matched the current filters, then suggest another keyword or region."
         if isinstance(total, int) and total > 0:
@@ -622,6 +693,39 @@ class ContextBuilder:
         if not compact:
             return None
         return SearchCatalogContextDto.model_validate(compact)
+
+    def _build_knowledge_hits(
+        self,
+        *,
+        session_state: AgentSessionState,
+    ) -> KnowledgeHitsContextDto | None:
+        raw_hits = self._memory_value(session_state.working_memory, "knowledge_hits")
+        if not isinstance(raw_hits, list) or not raw_hits:
+            return None
+
+        hits = [
+            KnowledgeHitContextDto(
+                title=self._string_or_none(item.get("title")),
+                source_uri=self._string_or_none(item.get("source_uri")),
+                source_type=self._string_or_none(item.get("source_type")),
+                score=self._float_or_none(item.get("score")),
+                snippet=self._string_or_none(item.get("snippet")),
+            )
+            for item in raw_hits[:4]
+            if isinstance(item, dict)
+        ]
+        if not hits:
+            return None
+        query_meta = session_state.working_memory.get("last_knowledge_query")
+        payload = KnowledgeHitsContextDto(
+            query=self._string_or_none(query_meta.get("text") if isinstance(query_meta, dict) else None),
+            total=self._int_or_none(len(raw_hits)),
+            hits=hits,
+        )
+        compact = self._compact_value(payload.model_dump(mode="json", exclude_none=True))
+        if not compact:
+            return None
+        return KnowledgeHitsContextDto.model_validate(compact)
 
     def _build_shop_details(
         self,

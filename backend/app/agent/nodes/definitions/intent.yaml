@@ -9,6 +9,7 @@ allowed_tools_mode: replace
 allowed_tools:
   - invoke_worker
   - db_query_tool
+  - knowledge_search_tool
   - geo_resolve_tool
   - route_plan_tool
   - summary_tool

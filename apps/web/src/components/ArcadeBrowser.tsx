@@ -1,10 +1,10 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef } from "react";
-import { getArcadeDetail, listArcades, listCities, listCounties, listProvinces } from "../api/client";
-import { convertClientLocationToGcj02, geocodeAddressToGcj02, getArcadeGcjPoint } from "../lib/amapCoords";
+import { getArcadeDetail, listArcades, listCities, listCounties, listProvinces, lookupKnowledge } from "../api/client";
+import { convertClientLocationToGcj02, geocodeAddressCandidatesToGcj02, geocodeAddressToGcj02, getArcadeGcjPoint } from "../lib/amapCoords";
 import { buildAmapMarkerUri, buildAmapNavigationUri } from "../lib/amapUri";
 import { warmupClientLocationCache } from "../lib/clientLocation";
-import { useArcadeBrowserStore } from "../stores/arcadeBrowserStore";
-import type { ArcadeSummary, GeoPoint } from "../types";
+import { useArcadeBrowserStore, type SearchFallbackCandidate } from "../stores/arcadeBrowserStore";
+import type { ArcadeSummary, GeoPoint, KnowledgeArcadeCandidate } from "../types";
 import { ArcadeDetailPanel, type ArcadeDetailViewModel } from "./arcade/ArcadeDetailPanel";
 import { ArcadeSearchPanel } from "./arcade/ArcadeSearchPanel";
 import {
@@ -30,7 +30,9 @@ export function ArcadeBrowser() {
   const clientLocation = useArcadeBrowserStore((state) => state.clientLocation);
   const clientOriginGcj = useArcadeBrowserStore((state) => state.clientOriginGcj);
   const selectedRegionPoint = useArcadeBrowserStore((state) => state.selectedRegionPoint);
+  const searchFallback = useArcadeBrowserStore((state) => state.searchFallback);
   const detailRequestIdRef = useRef(0);
+  const setSelectedFallbackCandidate = useArcadeBrowserStore((state) => state.setSelectedFallbackCandidate);
 
   useEffect(() => {
     let cancelled = false;
@@ -132,6 +134,126 @@ export function ArcadeBrowser() {
     [paged.items, selectedSourceId]
   );
 
+  function buildMapLookupQuery(item: ArcadeSummary): string {
+    const parts = [item.name, item.address, item.county_name, item.city_name, item.province_name]
+      .map((value) => value?.trim())
+      .filter(Boolean) as string[];
+    return parts.join(" ");
+  }
+
+  function pickBestSearchMatch(items: ArcadeSummary[], shopName: string): ArcadeSummary | null {
+    const keyword = shopName.trim().toLowerCase();
+    if (!items.length) {
+      return null;
+    }
+    if (!keyword) {
+      return items[0] ?? null;
+    }
+    const exact = items.find((item) => item.name.trim().toLowerCase() === keyword);
+    if (exact) {
+      return exact;
+    }
+    const partial = items.find((item) => item.name.trim().toLowerCase().includes(keyword));
+    return partial ?? items[0] ?? null;
+  }
+
+  function buildFallbackMessage(shopName: string, knowledgeHitCount: number, candidateCount: number): string {
+    const trimmed = shopName.trim();
+    const geocoded = candidateCount > 0;
+    if (!trimmed) {
+      return "这边暂时没有查到匹配的机厅结果，您可以换个机厅名称或补充城市后再试试。";
+    }
+    if (candidateCount > 1 && knowledgeHitCount > 0) {
+      return `您好，这边暂时没有在数据库里检索到“${trimmed}”这家机厅，知识库里有相关提及。我先把同名高德结果列在下方，您可以点选查看位置，再决定是否前往高德。`;
+    }
+    if (candidateCount > 1) {
+      return `您好，这边暂时没有在数据库里检索到“${trimmed}”这家机厅，不过我找到了多个同名高德结果，已经列在下方。您可以点选查看位置，再决定是否前往高德。`;
+    }
+    if (knowledgeHitCount > 0 && geocoded) {
+      return `您好，这边暂时没有在数据库里检索到“${trimmed}”这家机厅，知识库里有相关提及，我先帮您把高德地图定位结果展示在右侧，您可以先核对一下位置。`;
+    }
+    if (knowledgeHitCount > 0) {
+      return `您好，这边暂时没有在数据库里检索到“${trimmed}”这家机厅，不过知识库里有相关提及。当前还没拿到稳定地图坐标，建议您补充城市或更完整店名，我再继续帮您查。`;
+    }
+    if (geocoded) {
+      return `您好，这边暂时没有在数据库和知识库里检索到“${trimmed}”这家机厅，不过我根据名称帮您做了高德地图检索，右侧先展示一个临时点位供您参考。`;
+    }
+    return `您好，这边暂时没有在数据库和知识库里检索到“${trimmed}”这家机厅，也还没有拿到可用地图点位。您可以补充城市、商场名或更完整店名，我再继续帮您查。`;
+  }
+
+  function knowledgeCandidateToFallbackCandidate(candidate: KnowledgeArcadeCandidate): SearchFallbackCandidate | null {
+    const point = candidate.geo?.gcj02 ?? null;
+    if (!point) {
+      return null;
+    }
+    return {
+      id: candidate.id,
+      name: candidate.name,
+      address: candidate.address || "",
+      regionText: candidate.region_text || [candidate.province_name, candidate.city_name, candidate.county_name].filter(Boolean).join(" / "),
+      level: candidate.source_type || "knowledge",
+      point,
+      source: "knowledge",
+      transport: candidate.transport,
+      sourceUri: candidate.source_uri || undefined
+    };
+  }
+
+  async function resolveSearchFallback(shopName: string): Promise<void> {
+    const trimmed = shopName.trim();
+    const store = useArcadeBrowserStore.getState();
+    if (!trimmed) {
+      store.setSearchFallback(null);
+      return;
+    }
+
+    let knowledgeHits: Awaited<ReturnType<typeof lookupKnowledge>>["hits"] = [];
+    let knowledgeArcadeCandidates: Awaited<ReturnType<typeof lookupKnowledge>>["arcade_candidates"] = [];
+    try {
+      const knowledge = await lookupKnowledge(trimmed, 3);
+      knowledgeHits = knowledge.hits ?? [];
+      knowledgeArcadeCandidates = knowledge.arcade_candidates ?? [];
+    } catch {
+      knowledgeHits = [];
+      knowledgeArcadeCandidates = [];
+    }
+
+    const structuredCandidates = knowledgeArcadeCandidates
+      .map((item) => knowledgeCandidateToFallbackCandidate(item))
+      .filter((item): item is SearchFallbackCandidate => Boolean(item));
+
+    let candidates: SearchFallbackCandidate[] = [...structuredCandidates];
+    if (mapRuntime?.AMap) {
+      const geocodeCandidates = await geocodeAddressCandidatesToGcj02(mapRuntime.AMap, trimmed, clientLocation?.city || undefined);
+      const mappedGeocodeCandidates = geocodeCandidates.map((item) => ({
+        ...item,
+        source: "geocode" as const
+      }));
+      const knownIds = new Set(candidates.map((item) => `${item.point.lng.toFixed(6)},${item.point.lat.toFixed(6)}`));
+      for (const candidate of mappedGeocodeCandidates) {
+        const key = `${candidate.point.lng.toFixed(6)},${candidate.point.lat.toFixed(6)}`;
+        if (!knownIds.has(key)) {
+          candidates.push(candidate);
+          knownIds.add(key);
+        }
+      }
+    }
+    const point = candidates[0]?.point ?? null;
+
+    store.setSearchFallback({
+      query: trimmed,
+      mapPoint: point,
+      mapLabel: candidates[0]?.name || trimmed,
+      message: buildFallbackMessage(trimmed, knowledgeHits.length, candidates.length),
+      knowledgeHits,
+      knowledgeArcadeCandidates,
+      candidates,
+      selectedCandidateId: candidates[0]?.id ?? null,
+      page: 1,
+      pageSize: 4
+    });
+  }
+
   const loadDetailForItem = useCallback(async (item: ArcadeSummary) => {
     const requestId = ++detailRequestIdRef.current;
     const store = useArcadeBrowserStore.getState();
@@ -169,6 +291,7 @@ export function ArcadeBrowser() {
     const state = useArcadeBrowserStore.getState();
     state.setLoading(true);
     state.setError("");
+    state.setSearchFallback(null);
 
     try {
       const legacyKeyword = [state.shopName, state.titleName].filter(Boolean).join(" ");
@@ -194,6 +317,13 @@ export function ArcadeBrowser() {
 
       const existing = payload.items.find((item) => item.source_id === latestStore.selectedSourceId) ?? null;
       if (!existing) {
+        const bestMatch = pickBestSearchMatch(payload.items, state.shopName);
+        if (bestMatch) {
+          latestStore.setSelectedSourceId(bestMatch.source_id);
+          latestStore.setMapStatus("idle");
+          await loadDetailForItem(bestMatch);
+          return;
+        }
         detailRequestIdRef.current += 1;
         latestStore.setSelectedSourceId(null);
         latestStore.setDetail(null);
@@ -201,9 +331,11 @@ export function ArcadeBrowser() {
         latestStore.setDetailLoading(false);
         latestStore.setSelectedRegionPoint(null);
         latestStore.setMapStatus("idle");
+        await resolveSearchFallback(state.shopName);
         return;
       }
       latestStore.setSelectedSourceId(existing.source_id);
+      latestStore.setSearchFallback(null);
       if (latestStore.detail?.source_id !== existing.source_id || latestStore.detailError) {
         await loadDetailForItem(existing);
       }
@@ -237,15 +369,19 @@ export function ArcadeBrowser() {
 
     async function resolveSelectedRegionPoint() {
       useArcadeBrowserStore.getState().setSelectedRegionPoint(null);
-      if (selectedCatalogPoint || !selectedArcade || !selectedRegionQuery || !mapRuntime?.AMap) {
+      if (selectedCatalogPoint || !selectedArcade || !mapRuntime?.AMap) {
         return;
       }
-      const point = await geocodeAddressToGcj02(mapRuntime.AMap, selectedRegionQuery, selectedArcade.city_name);
+      const point = await geocodeAddressToGcj02(
+        mapRuntime.AMap,
+        buildMapLookupQuery(selectedArcade),
+        selectedArcade.city_name
+      );
       if (!cancelled && point) {
         useArcadeBrowserStore.getState().setSelectedRegionPoint({
           sourceId: selectedArcade.source_id,
-          query: selectedRegionQuery,
-          label: selectedRegionLabel,
+          query: buildMapLookupQuery(selectedArcade),
+          label: selectedArcade.name,
           point
         });
       }
@@ -268,14 +404,15 @@ export function ArcadeBrowser() {
   if (
     selectedRegionPoint
     && selectedRegionPoint.sourceId === selectedArcade?.source_id
-    && selectedRegionPoint.query === selectedRegionQuery
+    && selectedRegionPoint.query === buildMapLookupQuery(selectedArcade)
   ) {
     selectedRegionCenterPoint = selectedRegionPoint.point;
   }
 
   const selectedPoint = selectedCatalogPoint;
-  const mapCenter = selectedPoint ?? selectedRegionCenterPoint ?? selectedKnownRegionCenter;
-  const mapZoom = selectedPoint ? 15 : getArcadeRegionZoom(selectedArcade);
+  const fallbackMapPoint = searchFallback?.mapPoint ?? null;
+  const mapCenter = selectedPoint ?? selectedRegionCenterPoint ?? fallbackMapPoint ?? selectedKnownRegionCenter;
+  const mapZoom = selectedPoint || fallbackMapPoint ? 15 : getArcadeRegionZoom(selectedArcade);
   const handleMarkerSelect = useCallback((item: ArcadeSummary) => {
     void selectShop(item);
   }, [selectShop]);
@@ -290,6 +427,31 @@ export function ArcadeBrowser() {
   }, [paged]);
 
   const actions = useMemo<MapAction[]>(() => {
+    if (!selectedArcade && fallbackMapPoint && searchFallback) {
+      return [
+        {
+          key: "fallback-view",
+          label: "查看当前候选",
+          href: buildAmapMarkerUri({
+            point: fallbackMapPoint,
+            name: searchFallback.mapLabel
+          }),
+          emphasis: "secondary"
+        },
+        {
+          key: "fallback-navigate",
+          label: "前往高德",
+          href: buildAmapNavigationUri({
+            destination: fallbackMapPoint,
+            destinationName: searchFallback.mapLabel,
+            origin: clientOriginGcj,
+            originName: clientLocation?.region_text || clientLocation?.formatted_address || "我的位置",
+            mode: "walk"
+          }),
+          emphasis: "primary"
+        }
+      ];
+    }
     if (!selectedPoint || !selectedArcade) {
       return [];
     }
@@ -320,9 +482,12 @@ export function ArcadeBrowser() {
         emphasis: "primary"
       }
     ];
-  }, [clientLocation, clientOriginGcj, selectedArcade, selectedPoint]);
+  }, [clientLocation, clientOriginGcj, fallbackMapPoint, searchFallback, selectedArcade, selectedPoint]);
 
   const mapStatusText = useMemo(() => {
+    if (!selectedArcade && searchFallback?.message) {
+      return searchFallback.message;
+    }
     if (!selectedArcade) {
       return "选择一个机厅后加载地图";
     }
@@ -342,7 +507,7 @@ export function ArcadeBrowser() {
       return "该机厅暂时没有可用地图定位";
     }
     return "";
-  }, [mapCenter, mapStatus, selectedArcade, selectedPoint, selectedRegionLabel, selectedRegionPoint?.label]);
+  }, [mapCenter, mapStatus, searchFallback?.message, selectedArcade, selectedPoint, selectedRegionLabel, selectedRegionPoint?.label]);
 
   const detailView = useMemo<ArcadeDetailViewModel>(() => ({
     mapCenter,
@@ -352,12 +517,14 @@ export function ArcadeBrowser() {
     selectedRegionLabel,
     selectedRegionPoint,
     mapStatusText,
-    actions
+    actions,
+    searchFallback
   }), [
     actions,
     mapCenter,
     mapStatusText,
     mapZoom,
+    searchFallback,
     selectedFallbackRegionName,
     selectedPoint,
     selectedRegionLabel,
@@ -377,6 +544,7 @@ export function ArcadeBrowser() {
           onSubmit={onSubmit}
           onSelectShop={(item) => void selectShop(item)}
           onSearchPage={(page) => void runSearch(page)}
+          onSelectFallbackCandidate={setSelectedFallbackCandidate}
         />
         <ArcadeDetailPanel
           selectedArcade={selectedArcade}

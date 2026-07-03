@@ -167,3 +167,29 @@ def resolve_llm_config(settings: Settings) -> LLMConfig:
         profile_name=settings.agent_provider_profile,
         profile_enabled=enabled,
     )
+
+
+def resolve_vision_llm_config(settings: Settings) -> LLMConfig | None:
+    """Build optional vision-provider config from dedicated env overrides."""
+    configured = any(
+        (
+            settings.vision_llm_api_key.strip(),
+            settings.vision_llm_base_url.strip(),
+            settings.vision_llm_model.strip(),
+        )
+    )
+    if not configured:
+        return None
+    return LLMConfig(
+        api_key=settings.vision_llm_api_key.strip() or settings.llm_api_key,
+        base_url=settings.vision_llm_base_url.strip() or settings.llm_base_url,
+        model=settings.vision_llm_model.strip() or settings.llm_model,
+        timeout_seconds=max(1.0, float(settings.vision_llm_timeout_seconds)),
+        temperature=max(0.0, float(settings.vision_llm_temperature)),
+        max_tokens=max(32, int(settings.vision_llm_max_tokens)),
+        tool_choice="auto",
+        parallel_tool_calls=False,
+        prefer_chat_completions=False,
+        profile_name="vision",
+        profile_enabled=True,
+    )

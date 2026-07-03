@@ -2,10 +2,14 @@ import type { ViewMode } from "../types";
 
 const VIEW_MODE_PATHS: Record<ViewMode, string> = {
   chat: "/",
-  arcades: "/arcades"
+  arcades: "/arcades",
+  knowledge: "/knowledge"
 };
 
 export function readViewModeFromPath(pathname: string): ViewMode {
+  if (pathname === VIEW_MODE_PATHS.knowledge || pathname.startsWith(`${VIEW_MODE_PATHS.knowledge}/`)) {
+    return "knowledge";
+  }
   return pathname === VIEW_MODE_PATHS.arcades || pathname.startsWith(`${VIEW_MODE_PATHS.arcades}/`)
     ? "arcades"
     : "chat";

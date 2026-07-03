@@ -7,7 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-ContextBlockKey = Literal["query", "search_catalog", "shop_details", "route"]
+ContextBlockKey = Literal["query", "search_catalog", "knowledge_hits", "shop_details", "route"]
 
 
 class ContextBlockRefDto(BaseModel):
@@ -69,6 +69,24 @@ class SearchCatalogContextDto(BaseModel):
 
     total: int | None = None
     top_shops: list[SearchCatalogShopDto] = Field(default_factory=list)
+
+
+class KnowledgeHitContextDto(BaseModel):
+    """One retrieved knowledge snippet prepared for answer composition."""
+
+    title: str | None = None
+    source_uri: str | None = None
+    source_type: str | None = None
+    score: float | None = None
+    snippet: str | None = None
+
+
+class KnowledgeHitsContextDto(BaseModel):
+    """Top textual evidence returned from the RAG pipeline."""
+
+    query: str | None = None
+    total: int | None = None
+    hits: list[KnowledgeHitContextDto] = Field(default_factory=list)
 
 
 class ShopBasicContextDto(BaseModel):
@@ -156,5 +174,6 @@ class RuntimeContextPayloadDto(BaseModel):
     directory: ContextDirectoryDto
     query: QueryContextDto | None = None
     search_catalog: SearchCatalogContextDto | None = None
+    knowledge_hits: KnowledgeHitsContextDto | None = None
     shop_details: list[ShopDetailContextDto] = Field(default_factory=list)
     route: RouteContextDto | None = None

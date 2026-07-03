@@ -11,8 +11,10 @@ logger = get_logger(__name__)
 async def on_startup(container: AppContainer) -> None:
     stats = container.store.health()
     await container.tool_registry.refresh_tools()
+    rag_status = container.rag_service.warmup()
     providers = container.tool_registry.provider_health()
     logger.info("Data store loaded: %s", stats)
+    logger.info("RAG warmup status: %s", rag_status)
     logger.info("Tool provider status: %s", providers)
 
 

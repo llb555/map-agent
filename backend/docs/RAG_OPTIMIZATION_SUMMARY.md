@@ -64,7 +64,7 @@ RAG_RERANKER_TIMEOUT_SECONDS=20
 **实现内容：**
 - 自实现的BM25索引（无需外部依赖）
 - 向量检索 + BM25关键词检索
-- RRF（Reciprocal Rank Fusion）得分融合
+- 加权得分融合（`alpha × vector + (1 - alpha) × bm25`）
 - 可调节的alpha权重参数
 
 **配置项：**
@@ -80,7 +80,24 @@ RAG_HYBRID_ALPHA=0.5  # 0.0=纯BM25, 1.0=纯向量
 **文档：**
 - [RAG_HYBRID_SEARCH_GUIDE.md](backend/docs/RAG_HYBRID_SEARCH_GUIDE.md)
 
-### 3. ⏸️ 向量数据库集成（暂未实施）
+### 3. ✅ 语义分块（Semantic Chunking）
+
+**实现内容：**
+- 新增 `RAG_SEMANTIC_CHUNKING_ENABLED` 配置开关
+- 启用时优先尝试 `SemanticChunker`
+- 依赖不可用或分块失败时自动回退到 `RecursiveCharacterTextSplitter`
+- `health()` 返回当前语义分块开关状态
+
+**配置项：**
+```bash
+RAG_SEMANTIC_CHUNKING_ENABLED=true
+```
+
+**说明：**
+- 这是可选优化，不会替代现有固定分块作为唯一方案
+- 更适合段落边界明显、语义跨度较大的知识文档
+
+### 4. ⏸️ 向量数据库集成（暂未实施）
 
 **原因：**
 - 当前知识库规模小（<10文档），纯内存足够
@@ -160,6 +177,7 @@ RAG_HYBRID_ALPHA=0.6
 
 2. **backend/app/core/config.py**
    - 新增配置项：
+     - `rag_semantic_chunking_enabled: bool`
      - `rag_reranker_enabled: bool`
      - `rag_reranker_model: str`
      - `rag_reranker_top_k_multiplier: int`
@@ -184,10 +202,12 @@ RAG_HYBRID_ALPHA=0.6
    - 预期提升：10-20% Top-1准确率
    - 开销：+50-100ms延迟，+200MB内存
 
-2. **优化分块策略**
-   - 当前：固定长度分块（700字符）
-   - 改进：语义分块（按段落、句子边界）
-   - 工具：`langchain.text_splitter.SemanticChunker`
+2. **启用语义分块**
+   ```bash
+   RAG_SEMANTIC_CHUNKING_ENABLED=true
+   ```
+   - 当前已支持，可按知识库质量决定是否开启
+   - 若依赖不可用或效果不佳，会自动回退固定分块
 
 3. **升级Embedding模型**
    - 当前：`paraphrase-multilingual-MiniLM-L12-v2`

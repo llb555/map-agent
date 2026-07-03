@@ -49,7 +49,7 @@ class SubAgentBuilder:
             "search_worker": SubAgentProfile(
                 name="search_worker",
                 prompt_file="search_worker.md",
-                allowed_tools=["db_query_tool", "mcp__*"],
+                allowed_tools=["db_query_tool", "location_resolve_tool", "mcp__*"],
                 skill_files=["search_result_reading.md"],
             ),
             "navigation_worker": SubAgentProfile(

@@ -1,0 +1,38 @@
+{
+  "name": "location_resolve_tool",
+  "kind": "function",
+  "description": "Resolve a named place such as a station, mall, landmark, or address into longitude/latitude using the local AMap REST-backed resolver. Do not use this for pure administrative areas like provinces, cities, districts, or counties when area-name filters already answer the request.",
+  "executor": "app.agent.tools.builtin.executors.location_resolve:execute",
+  "capabilities": ["builtin", "read_only", "geo"],
+  "metadata": {
+    "tool_function": "app.agent.tools.builtin.executors.location_resolve:execute"
+  },
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "query": {
+        "minLength": 1,
+        "title": "Query",
+        "type": "string"
+      },
+      "province_name": {
+        "anyOf": [{ "type": "string" }, { "type": "null" }],
+        "default": null,
+        "title": "Province Name"
+      },
+      "city_name": {
+        "anyOf": [{ "type": "string" }, { "type": "null" }],
+        "default": null,
+        "title": "City Name"
+      },
+      "county_name": {
+        "anyOf": [{ "type": "string" }, { "type": "null" }],
+        "default": null,
+        "title": "County Name"
+      }
+    },
+    "required": ["query"],
+    "title": "LocationResolveArgs",
+    "type": "object"
+  }
+}

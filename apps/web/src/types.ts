@@ -3,7 +3,7 @@ export type RegionItem = {
   name: string;
 };
 
-export type ViewMode = "chat" | "arcades";
+export type ViewMode = "chat" | "arcades" | "knowledge";
 
 export type ArcadeSortBy = "default" | "updated_at" | "source_id" | "arcade_count" | "title_quantity" | "distance";
 export type SortOrder = "asc" | "desc";
@@ -121,6 +121,16 @@ export type ChatRequest = {
   city_code?: string;
   county_code?: string;
   page_size?: number;
+  attachments?: ChatAttachment[];
+};
+
+export type ChatAttachment = {
+  name: string;
+  mime_type: string;
+  size_bytes: number;
+  kind: "image" | "document";
+  preview_text?: string | null;
+  image_data_url?: string | null;
 };
 
 export type RouteSummary = {
@@ -163,6 +173,7 @@ export type ChatHistoryTurn = {
   content: string;
   name?: string | null;
   call_id?: string | null;
+  payload?: Record<string, unknown> | null;
   created_at: string;
 };
 
@@ -193,6 +204,65 @@ export type ChatSessionDetail = {
   created_at: string;
   updated_at: string;
   turns: ChatHistoryTurn[];
+};
+
+export type KnowledgeFileItem = {
+  name: string;
+  relative_path: string;
+  suffix: string;
+  size_bytes: number;
+  updated_at: number;
+};
+
+export type KnowledgeStatus = {
+  directory: string;
+  enabled: boolean;
+  source_exists: boolean;
+  source_is_dir: boolean;
+  supported_suffixes: string[];
+  semantic_chunking_enabled: boolean;
+  reranker_enabled: boolean;
+  hybrid_search_enabled: boolean;
+  index_ready: boolean;
+  chunk_count: number;
+  load_error?: string | null;
+  files: KnowledgeFileItem[];
+};
+
+export type KnowledgeUploadResponse = {
+  file: KnowledgeFileItem;
+  rag: KnowledgeStatus;
+};
+
+export type KnowledgeLookupHit = {
+  title?: string | null;
+  source_uri?: string | null;
+  source_type?: string | null;
+  score?: number | null;
+  snippet?: string | null;
+};
+
+export type KnowledgeArcadeCandidate = {
+  id: string;
+  name: string;
+  address?: string | null;
+  region_text?: string | null;
+  province_name?: string | null;
+  city_name?: string | null;
+  county_name?: string | null;
+  transport?: string | null;
+  source_uri?: string | null;
+  source_type?: string | null;
+  score?: number | null;
+  geo?: ArcadeGeo | null;
+};
+
+export type KnowledgeLookupResponse = {
+  query: string;
+  status: string;
+  total_hits: number;
+  hits: KnowledgeLookupHit[];
+  arcade_candidates: KnowledgeArcadeCandidate[];
 };
 
 export type ChatStreamEventName =

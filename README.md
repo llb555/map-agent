@@ -135,6 +135,20 @@ LLM_TIMEOUT_SECONDS=20
 LLM_TEMPERATURE=0.2
 LLM_MAX_TOKENS=500
 
+RAG_ENABLED=false
+RAG_SOURCE_PATH=data/local/knowledge
+RAG_CHUNK_SIZE=700
+RAG_CHUNK_OVERLAP=120
+RAG_SEMANTIC_CHUNKING_ENABLED=false
+RAG_TOP_K=4
+RAG_EMBEDDING_API_KEY=
+RAG_EMBEDDING_BASE_URL=
+RAG_EMBEDDING_MODEL=local-hash-v1
+RAG_EMBEDDING_TIMEOUT_SECONDS=20
+RAG_VECTOR_BACKEND=memory
+RAG_FAISS_INDEX_PATH=data/runtime/rag_index.faiss
+RAG_FAISS_METADATA_PATH=data/runtime/rag_index_meta.json
+
 AGENT_MAX_STEPS=20
 AGENT_CONTEXT_WINDOW=24
 AGENT_PROVIDER_PROFILE=default
@@ -158,6 +172,18 @@ ARCADE_GEO_REQUEST_TIMEOUT_SECONDS=1.2
 - `ARCADE_DATA_SOURCE=supabase` 时必须配置 `SUPABASE_URL`，以及 `SUPABASE_ANON_KEY` 或 `SUPABASE_SERVICE_ROLE_KEY`。缺少配置会启动失败，不会静默回退 JSONL。
 - `SUPABASE_SERVICE_ROLE_KEY` 仅用于后端或导入脚本，不要暴露给浏览器端。
 - `LLM_API_KEY` 为空时服务可以启动，机厅列表接口也可使用，但 Agent 对话不会产生有意义的模型编排结果。API Key需要使用兼容OpenAI的接口，建议使用DeepSeek的API。
+- `RAG_ENABLED=true` 后会启用 LangChain-backed 知识检索工具 `knowledge_search_tool`。`RAG_SOURCE_PATH` 支持目录或单文件，目录下会扫描 `.md`、`.txt`、`.json`、`.jsonl`、`.pdf`、`.docx`、`.doc`。
+- `RAG_SEMANTIC_CHUNKING_ENABLED=true` 时会优先尝试 `SemanticChunker` 做语义分块；若依赖不可用或分块失败，会自动回退到当前固定长度分块。
+- `RAG_EMBEDDING_MODEL=local-hash-v1` 时会使用内置本地 embedding 回退，不依赖额外向量服务，适合先把 RAG 跑通。需要更好的语义效果时，再换成真实 embeddings API。
+- 如果想用本地真实 Transformer embedding，可以把 `RAG_EMBEDDING_MODEL` 设成 `sentence-transformers:<model-name>`，例如 `sentence-transformers:BAAI/bge-small-zh-v1.5`。
+- 若使用外部 embeddings API，`RAG_EMBEDDING_BASE_URL`、`RAG_EMBEDDING_API_KEY` 为空时会分别回退到 `LLM_BASE_URL`、`LLM_API_KEY`。
+- `RAG_VECTOR_BACKEND` 默认是 `memory`；设成 `faiss` 后会把知识库向量索引持久化到本地文件。
+- `RAG_FAISS_INDEX_PATH` 保存 `.faiss` 索引，`RAG_FAISS_METADATA_PATH` 保存 metadata sidecar。知识库上传/删除后仍然走当前的全量重建流程。
+- `.jsonl` / `.json` 知识源建议至少包含 `content` 或 `text` 字段，可选 `title`、`source_uri`、`source_type` 元数据。
+- `.pdf` 知识源使用 `pypdf` 提取文本并按页索引；扫描版 PDF 若无内嵌文本，当前不会自动 OCR。
+- `.docx` 知识源会提取正文、表格、页眉页脚、批注和文本框中的文本后索引。
+- `.doc` 知识源会先自动转换为 `.docx` 再索引；优先使用 `soffice/libreoffice`，macOS 上可回退 `textutil`。
+- 前端现在提供“知识库”管理页，可直接上传上述格式文件到 `RAG_SOURCE_PATH` 并自动触发重建索引。
 - `CHAT_SESSION_STORE_PATH`、`ARCADE_GEO_CACHE_PATH` 会写入 `data/runtime/`，目录不存在时会自动创建。
 - `AMAP_API_KEY` 用于高德 REST 路线、逆地理编码和后端地理缓存；高德 Web JS API 的浏览器 key 需要单独配在前端。
 

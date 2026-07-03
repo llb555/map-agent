@@ -1,11 +1,15 @@
 import type {
   ArcadeDetail,
   ArcadeSortBy,
+  ChatAttachment,
   ChatRequest,
   ChatSessionDispatch,
   ChatResponse,
   ChatSessionDetail,
   ChatSessionSummary,
+  KnowledgeLookupResponse,
+  KnowledgeStatus,
+  KnowledgeUploadResponse,
   ReverseGeocodeRequest,
   ReverseGeocodeResponse,
   PagedArcades,
@@ -81,6 +85,14 @@ async function postJson<T>(path: string, payload: unknown): Promise<T> {
   return parseJsonResponse<T>(resp, path);
 }
 
+async function postFormData<T>(path: string, formData: FormData): Promise<T> {
+  const resp = await fetch(buildUrl(path), {
+    method: "POST",
+    body: formData
+  });
+  return parseJsonResponse<T>(resp, path);
+}
+
 async function deleteJson(
   path: string,
   query?: Record<string, string | number | boolean | undefined | null>
@@ -135,6 +147,39 @@ export async function dispatchChatSession(payload: ChatRequest): Promise<ChatSes
   return postJson<ChatSessionDispatch>("/api/chat/sessions", payload);
 }
 
+export async function dispatchChatSessionWithUploads(payload: ChatRequest, files: File[]): Promise<ChatSessionDispatch> {
+  const formData = new FormData();
+  formData.append("session_id", payload.session_id || "");
+  formData.append("client_id", payload.client_id || "");
+  formData.append("message", payload.message || "");
+  formData.append("page_size", String(payload.page_size || 5));
+  if (payload.intent) {
+    formData.append("intent", payload.intent);
+  }
+  if (payload.shop_id != null) {
+    formData.append("shop_id", String(payload.shop_id));
+  }
+  if (payload.keyword) {
+    formData.append("keyword", payload.keyword);
+  }
+  if (payload.province_code) {
+    formData.append("province_code", payload.province_code);
+  }
+  if (payload.city_code) {
+    formData.append("city_code", payload.city_code);
+  }
+  if (payload.county_code) {
+    formData.append("county_code", payload.county_code);
+  }
+  if (payload.location) {
+    formData.append("location", JSON.stringify(payload.location));
+  }
+  files.forEach((file) => {
+    formData.append("files", file);
+  });
+  return postFormData<ChatSessionDispatch>("/api/chat/sessions/upload", formData);
+}
+
 export function buildChatStreamUrl(sessionId: string, lastEventId?: number, clientId?: string): string {
   return buildUrl(`/api/stream/${encodeURIComponent(sessionId)}`, {
     client_id: clientId,
@@ -160,4 +205,30 @@ export async function reverseGeocodeLocation(
   payload: ReverseGeocodeRequest
 ): Promise<ReverseGeocodeResponse> {
   return postJson<ReverseGeocodeResponse>("/api/location/reverse-geocode", payload);
+}
+
+export async function getKnowledgeStatus(): Promise<KnowledgeStatus> {
+  return fetchJson<KnowledgeStatus>(buildUrl("/api/knowledge/status"));
+}
+
+export async function lookupKnowledge(query: string, topK = 3): Promise<KnowledgeLookupResponse> {
+  return fetchJson<KnowledgeLookupResponse>(buildUrl("/api/knowledge/lookup", { q: query, top_k: topK }));
+}
+
+export async function reindexKnowledge(): Promise<KnowledgeStatus> {
+  return postJson<KnowledgeStatus>("/api/knowledge/reindex", {});
+}
+
+export async function uploadKnowledgeFile(file: File): Promise<KnowledgeUploadResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+  return postFormData<KnowledgeUploadResponse>("/api/knowledge/upload", formData);
+}
+
+export async function deleteKnowledgeFile(relativePath: string): Promise<void> {
+  return deleteJson("/api/knowledge/files", { relative_path: relativePath });
+}
+
+export async function deleteKnowledgeFilesBatch(relativePaths: string[]): Promise<KnowledgeStatus> {
+  return postJson<KnowledgeStatus>("/api/knowledge/files/delete-batch", { relative_paths: relativePaths });
 }

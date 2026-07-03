@@ -10,6 +10,15 @@
   .agent-map-grid {
     grid-template-columns: 1fr;
   }
+
+  .knowledge-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-empty-stat-row,
+  .chat-quick-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 960px) {
@@ -23,6 +32,8 @@
     display: block;
     min-height: 100dvh;
     height: 100dvh;
+    padding: 0;
+    gap: 0;
   }
 
   .app-sidebar {
@@ -34,6 +45,7 @@
     transform: translateX(-104%);
     transition: transform 0.2s ease;
     box-shadow: 16px 0 28px rgba(15, 27, 23, 0.18);
+    border-radius: 0 26px 26px 0;
   }
 
   .app-sidebar.is-open {
@@ -45,6 +57,7 @@
     min-height: 0;
     padding: max(12px, var(--safe-top)) max(12px, var(--safe-right)) max(12px, var(--safe-bottom)) max(12px, var(--safe-left));
     overflow: hidden;
+    border-radius: 0;
   }
 
   .topbar {
@@ -72,8 +85,29 @@
     padding-bottom: max(8px, var(--safe-bottom));
   }
 
+  .knowledge-shell {
+    min-height: 0;
+  }
+
   .browser-hero p {
     font-size: 0.92rem;
+  }
+
+  .browser-hero,
+  .knowledge-hero {
+    padding: 18px 18px 16px;
+  }
+
+  .topbar {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .topbar-meta {
+    margin-left: 0;
+    width: 100%;
+    white-space: normal;
+    grid-template-columns: 1fr;
   }
 }
 
@@ -103,21 +137,35 @@
     font-size: 0.92rem;
   }
 
+  .chat-empty-title {
+    max-width: none;
+    font-size: clamp(1.7rem, 6vw, 2.45rem);
+  }
+
+  .chat-empty-stat-row {
+    gap: 10px;
+  }
+
   .quick-chip {
-    min-height: 46px;
+    min-height: 108px;
   }
 
   .chat-scroll {
     padding: 16px 12px 10px;
   }
 
+  .chat-message-stack,
+  .chat-map-stack,
+  .chat-stage-stack {
+    width: 92%;
+  }
+
   .chat-bubble {
-    max-width: 92%;
     padding: 10px 11px;
   }
 
   .chat-event-bubble {
-    max-width: 92%;
+    gap: 9px;
   }
 
   .chat-map-card-item {
@@ -127,6 +175,10 @@
   .chat-composer {
     grid-template-columns: 1fr;
     padding: 10px 10px max(10px, var(--safe-bottom));
+  }
+
+  .chat-attachment-chip {
+    grid-template-columns: 1fr;
   }
 
   .chat-composer input,
@@ -144,9 +196,52 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .knowledge-stats {
+    grid-template-columns: 1fr;
+  }
+
   .browser-controls,
   .browser-detail {
     padding: 12px;
+  }
+
+  .knowledge-panel {
+    padding: 14px;
+  }
+
+  .sidebar-hero-stats,
+  .topbar-meta {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar-session-wrap {
+    min-height: 104px;
+    grid-template-columns: minmax(0, 1fr) 46px;
+  }
+
+  .sidebar-session-delete {
+    width: 34px;
+    height: 56px;
+  }
+
+  .knowledge-section-head,
+  .knowledge-selection-bar,
+  .knowledge-file-head {
+    display: grid;
+  }
+
+  .knowledge-selection-pill,
+  .knowledge-delete-btn {
+    justify-self: start;
+  }
+
+  .knowledge-hero-meta {
+    gap: 8px;
+  }
+
+  .knowledge-hero-pill {
+    width: 100%;
+    justify-content: center;
   }
 
   .browser-list-header {
@@ -165,12 +260,40 @@
     gap: 6px;
   }
 
+  .browser-detail-head,
+  .browser-title-section-head,
+  .browser-detail-info-grid {
+    display: grid;
+  }
+
+  .browser-detail-status,
+  .browser-title-section-pill {
+    justify-self: start;
+  }
+
+  .browser-detail-info-grid {
+    grid-template-columns: 1fr;
+  }
+
   .browser-geo-pill {
     justify-self: start;
   }
 
   .browser-pager {
     flex-wrap: wrap;
+    justify-content: stretch;
+  }
+
+  .browser-pager-panel {
+    padding: 12px;
+  }
+
+  .browser-page-summary,
+  .browser-pager-actions {
+    width: 100%;
+  }
+
+  .browser-pager-actions {
     justify-content: stretch;
   }
 
@@ -206,6 +329,13 @@
     min-height: 240px;
   }
 
+  .agent-map-state {
+    right: 10px;
+    bottom: 10px;
+    left: 10px;
+    font-size: 0.78rem;
+  }
+
   .agent-candidate-list {
     max-height: 220px;
   }
@@ -235,8 +365,11 @@
   }
 
   .chat-bubble,
-  .chat-event-bubble {
-    max-width: 96%;
+  .chat-event-bubble,
+  .chat-message-stack,
+  .chat-map-stack,
+  .chat-stage-stack {
+    width: 96%;
   }
 
   .chat-stage-list li {
@@ -250,6 +383,16 @@
 
   .browser-card {
     border-radius: 14px;
+  }
+
+  .app-main {
+    padding-right: max(10px, var(--safe-right));
+    padding-left: max(10px, var(--safe-left));
+  }
+
+  .browser-map-meta,
+  .browser-detail-pills {
+    gap: 6px;
   }
 
   .browser-item-btn {
@@ -277,6 +420,11 @@
     transform: none;
     box-shadow: none;
     filter: none;
+  }
+
+  .knowledge-upload:hover {
+    transform: none;
+    box-shadow: none;
   }
 }
 

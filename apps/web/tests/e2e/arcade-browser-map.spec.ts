@@ -235,6 +235,29 @@ async function installAmapMock(page: Page) {
           Polyline: MockPolyline,
           Scale: class {},
           ToolBar: class {},
+          Geocoder: class {
+            private options: any;
+            constructor(options: any) {
+              this.options = options;
+            }
+            getLocation(address: string, callback: (status: string, result: any) => void) {
+              if (address.includes("Arcade No Geo")) {
+                callback("complete", {
+                  geocodes: [{ location: { lng: 121.451, lat: 31.205 } }]
+                });
+                return;
+              }
+              if (address.includes("Magic Cube")) {
+                callback("complete", {
+                  geocodes: [{ location: { lng: 108.947, lat: 34.218 } }]
+                });
+                return;
+              }
+              callback("complete", {
+                geocodes: []
+              });
+            }
+          },
           convertFrom([lng, lat]: [number, number], _source: string, callback: (status: string, result: any) => void) {
             callback("complete", {
               locations: [{ lng: lng + 0.0065, lat: lat + 0.006 }]
@@ -358,12 +381,17 @@ async function installApiMocks(page: Page) {
     });
   });
   await page.route("**/api/v1/arcades?**", async (route) => {
+    const url = new URL(route.request().url());
+    const keyword = (url.searchParams.get("shop_name") || url.searchParams.get("keyword") || "").toLowerCase();
+    const filtered = keyword
+      ? ARCADES.filter((item) => item.name.toLowerCase().includes(keyword))
+      : ARCADES;
     await route.fulfill({
       json: {
-        items: ARCADES,
+        items: filtered,
         page: 1,
         page_size: 20,
-        total: ARCADES.length,
+        total: filtered.length,
         total_pages: 1
       }
     });
@@ -371,6 +399,37 @@ async function installApiMocks(page: Page) {
   await page.route("**/api/v1/arcades/*", async (route) => {
     const id = Number(route.request().url().split("/").pop());
     await route.fulfill({ json: DETAILS[id] });
+  });
+  await page.route("**/api/v1/knowledge/lookup**", async (route) => {
+    const url = new URL(route.request().url());
+    const q = url.searchParams.get("q") || "";
+    if (q.toLowerCase().includes("magic cube")) {
+      await route.fulfill({
+        json: {
+          query: q,
+          status: "completed",
+          total_hits: 1,
+          hits: [
+            {
+              title: "Magic Cube 提及",
+              source_uri: "knowledge://magic-cube",
+              source_type: "pdf",
+              score: 0.92,
+              snippet: "知识库里提到 Magic Cube 这家机厅。"
+            }
+          ]
+        }
+      });
+      return;
+    }
+    await route.fulfill({
+      json: {
+        query: q,
+        status: "completed",
+        total_hits: 0,
+        hits: []
+      }
+    });
   });
 }
 
@@ -499,6 +558,36 @@ test("ArcadeBrowser keeps list, map, and actions in sync", async ({ page }) => {
   await expect(page.getByText(/该机厅暂时没有精确地图坐标/)).toBeVisible();
   await expect(page.getByTestId("map-action-view")).toHaveCount(0);
   await expect(page.getByText("暂无地图定位")).toBeVisible();
+});
+
+test("ArcadeBrowser auto-selects first search result and geocodes by shop name for map rendering", async ({ page }) => {
+  await installAmapMock(page);
+  await installApiMocks(page);
+
+  await page.goto("/?view=arcades");
+
+  await page.getByLabel("机厅名称").fill("Arcade No Geo");
+  await page.getByRole("button", { name: "检索" }).click();
+
+  await expect(page.getByTestId("browser-detail-title")).toHaveText("Arcade No Geo");
+  await expect(page.getByTestId("arcade-list-item-102")).toHaveClass(/is-active/);
+  await expect(page.getByText(/地图已停在 Arcade No Geo/)).toBeVisible();
+});
+
+test("ArcadeBrowser shows fallback map and support-style message when database has no matching shop", async ({ page }) => {
+  await installAmapMock(page);
+  await installApiMocks(page);
+
+  await page.goto("/?view=arcades");
+
+  await page.getByLabel("机厅名称").fill("Magic Cube");
+  await page.getByRole("button", { name: "检索" }).click();
+
+  await expect(page.getByText("暂无结果")).toBeVisible();
+  await expect(page.getByTestId("browser-fallback-title")).toHaveText("Magic Cube");
+  await expect(page.getByText(/数据库里检索到“Magic Cube”/)).toBeVisible();
+  await expect(page.getByText(/知识库里有相关提及/)).toBeVisible();
+  await expect(page.getByRole("link", { name: "在高德查看临时点位" })).toBeVisible();
 });
 
 test("ChatPanel shows progressive route card from SSE route_ready", async ({ page }) => {

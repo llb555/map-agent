@@ -10,6 +10,9 @@ tool_policies:
   geo_resolve_tool:
     read_only: true
     concurrency_safe: true
+  location_resolve_tool:
+    read_only: true
+    concurrency_safe: true
   route_plan_tool:
     read_only: true
     concurrency_safe: true

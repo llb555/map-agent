@@ -13,7 +13,7 @@ router = APIRouter(prefix="/api/regions", tags=["regions"])
 
 @router.get("/provinces", response_model=list[RegionItemDto])
 def list_provinces(container: AppContainer = Depends(get_container)) -> list[RegionItemDto]:
-    return [RegionItemDto(code=row["code"], name=row["name"]) for row in container.store.list_provinces()]
+    return [RegionItemDto(code=row["code"], name=row["name"]) for row in container.region_service.list_provinces()]
 
 
 @router.get("/cities", response_model=list[RegionItemDto])
@@ -21,7 +21,7 @@ def list_cities(
     province_code: str = Query(..., min_length=1),
     container: AppContainer = Depends(get_container),
 ) -> list[RegionItemDto]:
-    rows = container.store.list_cities(province_code=province_code)
+    rows = container.region_service.list_cities(province_code)
     return [RegionItemDto(code=row["code"], name=row["name"]) for row in rows]
 
 
@@ -30,5 +30,5 @@ def list_counties(
     city_code: str = Query(..., min_length=1),
     container: AppContainer = Depends(get_container),
 ) -> list[RegionItemDto]:
-    rows = container.store.list_counties(city_code=city_code)
+    rows = container.region_service.list_counties(city_code)
     return [RegionItemDto(code=row["code"], name=row["name"]) for row in rows]

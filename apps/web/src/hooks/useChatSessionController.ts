@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useRef } from "react";
 import {
   buildChatStreamUrl,
   deleteChatSession,
+  dispatchChatSessionWithUploads,
   dispatchChatSession,
   getChatSession,
   listChatSessions
@@ -450,6 +451,12 @@ export function useChatSessionController() {
     store.setSidebarOpen(false);
   }
 
+  function openKnowledgeView(): void {
+    const store = useAppStore.getState();
+    store.setViewMode("knowledge");
+    store.setSidebarOpen(false);
+  }
+
   function startNewSession(): void {
     stopStream();
     const store = useAppStore.getState();
@@ -457,6 +464,8 @@ export function useChatSessionController() {
     store.resetActiveSessionState();
     writeStoredActiveSessionId(null);
     store.setInputValue("");
+    store.setPendingChatFiles([]);
+    store.setPendingChatAttachments([]);
     store.setChatError("");
     store.setSidebarOpen(false);
     store.setStreamItems([]);
@@ -467,7 +476,9 @@ export function useChatSessionController() {
     event.preventDefault();
     const currentState = useAppStore.getState();
     const message = currentState.inputValue.trim();
-    if (!message || currentState.sending || currentState.awaitingAssistant) {
+    const pendingFiles = currentState.pendingChatFiles;
+    const pendingAttachments = currentState.pendingChatAttachments;
+    if ((!message && pendingFiles.length === 0) || currentState.sending || currentState.awaitingAssistant) {
       return;
     }
 
@@ -485,20 +496,34 @@ export function useChatSessionController() {
       const store = useAppStore.getState();
 
       store.setInputValue("");
+      store.setPendingChatFiles([]);
+      store.setPendingChatAttachments([]);
       store.setActiveSessionId(sessionId);
       writeStoredActiveSessionId(sessionId);
       store.setActiveSessionStatus("running");
       store.setActiveMapArtifacts(null);
       store.setAwaitingAssistant(true);
-      store.setTurns((previous) => [...previous, { role: "user", content: message, created_at: optimisticCreatedAt }]);
+      store.setTurns((previous) => [
+        ...previous,
+        {
+          role: "user",
+          content: message || "已上传附件",
+          payload: pendingAttachments.length ? { attachments: pendingAttachments } : undefined,
+          created_at: optimisticCreatedAt
+        }
+      ]);
 
-      const dispatched = await dispatchChatSession({
+      const payload = {
         session_id: sessionId,
         client_id: clientIdRef.current,
         message,
         location: location ?? undefined,
-        page_size: 5
-      });
+        page_size: 5,
+        attachments: pendingAttachments
+      };
+      const dispatched = pendingFiles.length
+        ? await dispatchChatSessionWithUploads(payload, pendingFiles)
+        : await dispatchChatSession(payload);
       const latestStore = useAppStore.getState();
       latestStore.setActiveSessionId(dispatched.session_id);
       writeStoredActiveSessionId(dispatched.session_id);
@@ -509,6 +534,8 @@ export function useChatSessionController() {
       const store = useAppStore.getState();
       store.setChatError(err instanceof Error ? err.message : "发送失败");
       store.setInputValue(message);
+      store.setPendingChatFiles(pendingFiles);
+      store.setPendingChatAttachments(pendingAttachments);
       store.setActiveSessionId(previousSessionId);
       writeStoredActiveSessionId(previousSessionId);
       store.setActiveSessionStatus(previousSessionStatus);
@@ -587,6 +614,7 @@ export function useChatSessionController() {
   return {
     openChatView,
     openArcadesView,
+    openKnowledgeView,
     startNewSession,
     submitChat,
     quickAsk,

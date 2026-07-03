@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { StreamProgressItem } from "../lib/chatStream";
 import { readInitialViewMode, syncViewModeInUrl } from "../lib/viewMode";
 import type {
+  ChatAttachment,
   ChatHistoryTurn,
   ChatMapArtifacts,
   ChatSessionStatus,
@@ -27,6 +28,8 @@ type AppStore = {
   sending: boolean;
   deletingSessionId: string | null;
   inputValue: string;
+  pendingChatFiles: File[];
+  pendingChatAttachments: ChatAttachment[];
   chatError: string;
   streamConnected: boolean;
   activeSubagent: string | null;
@@ -45,6 +48,8 @@ type AppStore = {
   setSending: (sending: boolean) => void;
   setDeletingSessionId: (sessionId: string | null) => void;
   setInputValue: (value: string) => void;
+  setPendingChatFiles: (files: File[]) => void;
+  setPendingChatAttachments: (attachments: ChatAttachment[]) => void;
   setChatError: (error: string) => void;
   setStreamConnected: (connected: boolean) => void;
   setActiveSubagent: (subagent: string | null) => void;
@@ -66,6 +71,8 @@ export const useAppStore = create<AppStore>((set) => ({
   sending: false,
   deletingSessionId: null,
   inputValue: "",
+  pendingChatFiles: [],
+  pendingChatAttachments: [],
   chatError: "",
   streamConnected: false,
   activeSubagent: null,
@@ -89,6 +96,8 @@ export const useAppStore = create<AppStore>((set) => ({
   setSending: (sending) => set({ sending }),
   setDeletingSessionId: (deletingSessionId) => set({ deletingSessionId }),
   setInputValue: (inputValue) => set({ inputValue }),
+  setPendingChatFiles: (pendingChatFiles) => set({ pendingChatFiles }),
+  setPendingChatAttachments: (pendingChatAttachments) => set({ pendingChatAttachments }),
   setChatError: (chatError) => set({ chatError }),
   setStreamConnected: (streamConnected) => set({ streamConnected }),
   setActiveSubagent: (activeSubagent) => set({ activeSubagent }),
@@ -105,6 +114,8 @@ export const useAppStore = create<AppStore>((set) => ({
     turns: [],
     activeSubagent: null,
     activeMapArtifacts: null,
-    awaitingAssistant: false
+    awaitingAssistant: false,
+    pendingChatFiles: [],
+    pendingChatAttachments: []
   })
 }));

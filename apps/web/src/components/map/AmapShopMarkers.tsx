@@ -14,6 +14,7 @@ type AmapShopMarkersProps = {
   shops?: ArcadeSummary[];
   shop?: ArcadeSummary | null;
   point?: GeoPoint | null;
+  fallbackLabel?: string;
   selectedSourceId?: number | null;
   onSelectShop?: (shop: ArcadeSummary) => void;
 };
@@ -80,6 +81,7 @@ export function AmapShopMarkers({
   shops,
   shop,
   point,
+  fallbackLabel,
   selectedSourceId,
   onSelectShop
 }: AmapShopMarkersProps) {
@@ -108,6 +110,22 @@ export function AmapShopMarkers({
         selected: item.source_id === selectedSourceId || (!shops?.length && item.source_id === shop?.source_id)
       });
     });
+
+    if (!entries.length && point && fallbackLabel) {
+      entries.push({
+        shop: {
+          source: "fallback",
+          source_id: -1,
+          source_url: "",
+          name: fallbackLabel,
+          address: fallbackLabel,
+          arcade_count: 0,
+          geo: { gcj02: point, source: "geocode", precision: "approx" }
+        },
+        point,
+        selected: true
+      });
+    }
 
     if (!entries.length) {
       return;

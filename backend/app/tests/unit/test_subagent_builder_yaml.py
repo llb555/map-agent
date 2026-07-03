@@ -21,6 +21,7 @@ def test_subagent_builder_loads_executable_fields_from_definitions() -> None:
     assert main_profile.allowed_tools == [
         "invoke_worker",
         "db_query_tool",
+        "knowledge_search_tool",
         "geo_resolve_tool",
         "route_plan_tool",
         "summary_tool",
@@ -33,7 +34,7 @@ def test_subagent_builder_loads_executable_fields_from_definitions() -> None:
     ]
 
     assert search_profile.prompt_file == "search_worker.md"
-    assert search_profile.allowed_tools == ["db_query_tool", "mcp__*"]
+    assert search_profile.allowed_tools == ["db_query_tool", "location_resolve_tool", "knowledge_search_tool", "mcp__*"]
     assert search_profile.skill_files == ["search_result_reading.md"]
 
     assert nav_profile.prompt_file == "navigation_worker.md"
@@ -44,3 +45,11 @@ def test_subagent_builder_loads_executable_fields_from_definitions() -> None:
         "mcp__*",
     ]
     assert nav_profile.skill_files == ["search_result_reading.md", "navigation_result_reading.md"]
+
+
+def test_search_worker_default_tools_include_location_resolve_tool() -> None:
+    builder = SubAgentBuilder(enable_yaml_overlay=False)
+
+    profile = builder.get("search_worker")
+
+    assert "location_resolve_tool" in profile.allowed_tools

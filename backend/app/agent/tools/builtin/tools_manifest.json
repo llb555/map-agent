@@ -9,6 +9,12 @@
     "geo_resolve_tool": {
       "factory": "app.agent.tools.builtin.geo_resolve_tool:GeoResolveTool"
     },
+    "location_resolve_tool": {
+      "factory": "app.agent.tools.builtin.location_resolve_tool:LocationResolveTool",
+      "dependencies": {
+        "arcade_geo_resolver": "arcade_geo_resolver"
+      }
+    },
     "amap_config": {
       "factory": "app.agent.tools.builtin.route_plan_tool:AMapConfig",
       "dependencies": {
@@ -40,7 +46,9 @@
   "tools": [
     "schemas/invoke_worker.json",
     "schemas/db_query_tool.json",
+    "schemas/knowledge_search_tool.json",
     "schemas/geo_resolve_tool.json",
+    "schemas/location_resolve_tool.json",
     "schemas/route_plan_tool.json",
     "schemas/summary_tool.json"
   ]

@@ -6,6 +6,8 @@ import type {
   ArcadeSortBy,
   ArcadeSummary,
   GeoPoint,
+  KnowledgeArcadeCandidate,
+  KnowledgeLookupHit,
   PagedArcades,
   RegionItem,
   SortOrder
@@ -21,6 +23,31 @@ export type SelectedRegionPoint = {
   query: string;
   label: string;
   point: GeoPoint;
+};
+
+export type SearchFallbackState = {
+  query: string;
+  mapPoint: GeoPoint | null;
+  mapLabel: string;
+  message: string;
+  knowledgeHits: KnowledgeLookupHit[];
+  knowledgeArcadeCandidates: KnowledgeArcadeCandidate[];
+  candidates: SearchFallbackCandidate[];
+  selectedCandidateId: string | null;
+  page: number;
+  pageSize: number;
+};
+
+export type SearchFallbackCandidate = {
+  id: string;
+  name: string;
+  address: string;
+  regionText: string;
+  level?: string | null;
+  point: GeoPoint;
+  source: "knowledge" | "geocode";
+  transport?: string | null;
+  sourceUri?: string | null;
 };
 
 export const EMPTY_PAGED_ARCADES: PagedArcades = {
@@ -55,6 +82,7 @@ type ArcadeBrowserStore = {
   clientOriginGcj: GeoPoint | null;
   clientLocation: ReturnType<typeof loadCachedClientLocation>;
   selectedRegionPoint: SelectedRegionPoint | null;
+  searchFallback: SearchFallbackState | null;
   setProvinces: (provinces: RegionItem[]) => void;
   setCities: (cities: RegionItem[]) => void;
   setCounties: (counties: RegionItem[]) => void;
@@ -78,6 +106,9 @@ type ArcadeBrowserStore = {
   setClientOriginGcj: (clientOriginGcj: GeoPoint | null) => void;
   setClientLocation: (clientLocation: ReturnType<typeof loadCachedClientLocation>) => void;
   setSelectedRegionPoint: (selectedRegionPoint: SelectedRegionPoint | null) => void;
+  setSearchFallback: (searchFallback: SearchFallbackState | null) => void;
+  setSelectedFallbackCandidate: (candidateId: string) => void;
+  setFallbackPage: (page: number) => void;
 };
 
 export const useArcadeBrowserStore = create<ArcadeBrowserStore>((set) => ({
@@ -104,6 +135,7 @@ export const useArcadeBrowserStore = create<ArcadeBrowserStore>((set) => ({
   clientOriginGcj: null,
   clientLocation: loadCachedClientLocation(),
   selectedRegionPoint: null,
+  searchFallback: null,
   setProvinces: (provinces) => set({ provinces }),
   setCities: (cities) => set({ cities }),
   setCounties: (counties) => set({ counties }),
@@ -139,5 +171,34 @@ export const useArcadeBrowserStore = create<ArcadeBrowserStore>((set) => ({
   setMapStatus: (state, message = "") => set({ mapStatus: { state, message } }),
   setClientOriginGcj: (clientOriginGcj) => set({ clientOriginGcj }),
   setClientLocation: (clientLocation) => set({ clientLocation }),
-  setSelectedRegionPoint: (selectedRegionPoint) => set({ selectedRegionPoint })
+  setSelectedRegionPoint: (selectedRegionPoint) => set({ selectedRegionPoint }),
+  setSearchFallback: (searchFallback) => set({ searchFallback }),
+  setSelectedFallbackCandidate: (candidateId) =>
+    set((state) => {
+      if (!state.searchFallback) {
+        return state;
+      }
+      const selectedCandidate = state.searchFallback.candidates.find((item) => item.id === candidateId) ?? null;
+      return {
+        searchFallback: {
+          ...state.searchFallback,
+          selectedCandidateId: selectedCandidate?.id ?? state.searchFallback.selectedCandidateId,
+          mapPoint: selectedCandidate?.point ?? state.searchFallback.mapPoint,
+          mapLabel: selectedCandidate?.name ?? state.searchFallback.mapLabel
+        }
+      };
+    }),
+  setFallbackPage: (page) =>
+    set((state) => {
+      if (!state.searchFallback) {
+        return state;
+      }
+      const totalPages = Math.max(1, Math.ceil(state.searchFallback.candidates.length / state.searchFallback.pageSize));
+      return {
+        searchFallback: {
+          ...state.searchFallback,
+          page: Math.min(Math.max(page, 1), totalPages)
+        }
+      };
+    })
 }));

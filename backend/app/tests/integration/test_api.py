@@ -56,12 +56,38 @@ def _clear_llm_env() -> None:
         os.environ.pop(name, None)
 
 
+def _clear_rag_env() -> None:
+    for name in (
+        "RAG_ENABLED",
+        "RAG_SOURCE_PATH",
+        "RAG_CHUNK_SIZE",
+        "RAG_CHUNK_OVERLAP",
+        "RAG_SEMANTIC_CHUNKING_ENABLED",
+        "RAG_TOP_K",
+        "RAG_EMBEDDING_API_KEY",
+        "RAG_EMBEDDING_BASE_URL",
+        "RAG_EMBEDDING_MODEL",
+        "RAG_EMBEDDING_TIMEOUT_SECONDS",
+        "RAG_VECTOR_BACKEND",
+        "RAG_FAISS_INDEX_PATH",
+        "RAG_FAISS_METADATA_PATH",
+        "RAG_RERANKER_ENABLED",
+        "RAG_RERANKER_MODEL",
+        "RAG_RERANKER_TOP_K_MULTIPLIER",
+        "RAG_RERANKER_TIMEOUT_SECONDS",
+        "RAG_HYBRID_SEARCH_ENABLED",
+        "RAG_HYBRID_ALPHA",
+    ):
+        os.environ.pop(name, None)
+
+
 def _build_client(
     tmp_path: Path,
     *,
     session_store_path: Path | None = None,
     mcp_servers_dir: Path | None = None,
     cache_path: Path | None = None,
+    rag_env: dict[str, str] | None = None,
 ) -> TestClient:
     data_path = tmp_path / "shops.jsonl"
     empty_mcp_dir = tmp_path / "mcp_empty"
@@ -69,6 +95,7 @@ def _build_client(
     _seed_data(data_path)
     _clear_mcp_env()
     _clear_llm_env()
+    _clear_rag_env()
     os.environ["ARCADE_DATA_JSONL"] = str(data_path)
     os.environ["ARCADE_DATA_SOURCE"] = "jsonl"
     os.environ["CHAT_SESSION_STORE_PATH"] = str(session_store_path or (tmp_path / "chat_sessions.json"))
@@ -78,6 +105,9 @@ def _build_client(
     os.environ["LLM_MODEL"] = "test-model"
     os.environ["AMAP_API_KEY"] = "test-amap-key"
     os.environ["MCP_SERVERS_DIR"] = str(mcp_servers_dir or empty_mcp_dir)
+    os.environ["RAG_ENABLED"] = "false"
+    if rag_env:
+        os.environ.update(rag_env)
 
     from app.main import create_app
 
@@ -92,6 +122,7 @@ def _build_client_with_rows(
     *,
     session_store_path: Path | None = None,
     cache_path: Path | None = None,
+    rag_env: dict[str, str] | None = None,
 ) -> TestClient:
     data_path = tmp_path / "shops_custom.jsonl"
     empty_mcp_dir = tmp_path / "mcp_empty"
@@ -102,6 +133,7 @@ def _build_client_with_rows(
             handle.write("\n")
     _clear_mcp_env()
     _clear_llm_env()
+    _clear_rag_env()
     os.environ["ARCADE_DATA_JSONL"] = str(data_path)
     os.environ["ARCADE_DATA_SOURCE"] = "jsonl"
     os.environ["CHAT_SESSION_STORE_PATH"] = str(session_store_path or (tmp_path / "chat_sessions.json"))
@@ -111,6 +143,9 @@ def _build_client_with_rows(
     os.environ["LLM_MODEL"] = "test-model"
     os.environ["AMAP_API_KEY"] = "test-amap-key"
     os.environ["MCP_SERVERS_DIR"] = str(empty_mcp_dir)
+    os.environ["RAG_ENABLED"] = "false"
+    if rag_env:
+        os.environ.update(rag_env)
 
     from app.main import create_app
 
@@ -159,6 +194,245 @@ def test_health_arcades_and_chat(tmp_path: Path) -> None:
     chat_resp = client.post("/api/chat", json={"message": "find Gamma", "page_size": 3})
     assert chat_resp.status_code == 200
     assert chat_resp.json()["intent"] in {"search", "search_nearby"}
+
+
+def test_chat_dispatch_accepts_uploaded_file(tmp_path: Path) -> None:
+    client = _build_client(tmp_path)
+
+    dispatch_resp = client.post(
+        "/api/chat/sessions/upload",
+        data={"message": "请结合我上传的文档帮我总结", "page_size": "3"},
+        files={"files": ("notes.md", b"# Arcade Notes\n\nGamma Arcade address and transport tips.", "text/markdown")},
+    )
+    assert dispatch_resp.status_code == 202
+    session_id = dispatch_resp.json()["session_id"]
+
+    detail = _wait_for_session_status(client, session_id, "completed")
+    turns = detail["turns"]
+    assert turns
+    first_turn = turns[0]
+    assert first_turn["role"] == "user"
+    assert first_turn["payload"]["attachments"][0]["name"] == "notes.md"
+
+
+def test_regions_api_uses_region_service_with_store_fallback(tmp_path: Path) -> None:
+    client = _build_client(tmp_path)
+
+    provinces = client.get("/api/regions/provinces")
+    assert provinces.status_code == 200
+    assert provinces.json()[0]["code"] == "110000000000"
+
+    cities = client.get("/api/regions/cities", params={"province_code": "110000000000"})
+    assert cities.status_code == 200
+    assert cities.json()[0]["code"] == "110100000000"
+
+    counties = client.get("/api/regions/counties", params={"city_code": "110100000000"})
+    assert counties.status_code == 200
+    assert counties.json()[0]["code"] == "110101000000"
+
+
+def test_knowledge_upload_and_reindex(tmp_path: Path) -> None:
+    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-knowledge-upload"
+    client = _build_client(
+        tmp_path,
+        rag_env={
+            "RAG_ENABLED": "true",
+            "RAG_SOURCE_PATH": str(knowledge_dir),
+            "RAG_EMBEDDING_MODEL": "local-hash-v1",
+        },
+    )
+
+    status_before = client.get("/api/knowledge/status")
+    assert status_before.status_code == 200
+    assert status_before.json()["directory"] == str(knowledge_dir)
+
+    upload = client.post(
+        "/api/knowledge/upload",
+        files={"file": ("guide.md", b"# FAQ\n\nmaimai rules and hotel notes", "text/markdown")},
+    )
+    assert upload.status_code == 200
+    upload_body = upload.json()
+    assert upload_body["file"]["name"] == "guide.md"
+    assert upload_body["rag"]["chunk_count"] >= 1
+    assert (knowledge_dir / "guide.md").exists()
+
+    reindex = client.post("/api/knowledge/reindex")
+    assert reindex.status_code == 200
+    assert reindex.json()["index_ready"] is True
+
+
+def test_rag_warmup_builds_index_on_startup(tmp_path: Path) -> None:
+    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-rag-warmup-startup"
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    (knowledge_dir / "guide.md").write_text("# FAQ\n\nmaimai rules and hotel notes", encoding="utf-8")
+    client = _build_client(
+        tmp_path,
+        rag_env={
+            "RAG_ENABLED": "true",
+            "RAG_SOURCE_PATH": str(knowledge_dir),
+            "RAG_EMBEDDING_MODEL": "local-hash-v1",
+            "RAG_VECTOR_BACKEND": "faiss",
+            "RAG_FAISS_INDEX_PATH": str(knowledge_dir.parent / "test-rag-warmup-startup.faiss"),
+            "RAG_FAISS_METADATA_PATH": str(knowledge_dir.parent / "test-rag-warmup-startup-meta.json"),
+        },
+    )
+
+    status = client.get("/api/knowledge/status")
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload["index_ready"] is True
+    assert payload["chunk_count"] >= 1
+    assert Path(os.environ["RAG_FAISS_INDEX_PATH"]).exists()
+    assert Path(os.environ["RAG_FAISS_METADATA_PATH"]).exists()
+
+
+def test_knowledge_delete_file_and_refresh_status(tmp_path: Path) -> None:
+    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-knowledge-delete"
+    client = _build_client(
+        tmp_path,
+        rag_env={
+            "RAG_ENABLED": "true",
+            "RAG_SOURCE_PATH": str(knowledge_dir),
+            "RAG_EMBEDDING_MODEL": "local-hash-v1",
+        },
+    )
+
+    upload = client.post(
+        "/api/knowledge/upload",
+        files={"file": ("delete-me.md", b"# Temp\n\nremove this file", "text/markdown")},
+    )
+    assert upload.status_code == 200
+    assert (knowledge_dir / "delete-me.md").exists()
+
+    delete_resp = client.delete("/api/knowledge/files", params={"relative_path": "delete-me.md"})
+    assert delete_resp.status_code == 204
+    assert not (knowledge_dir / "delete-me.md").exists()
+
+    status_after = client.get("/api/knowledge/status")
+    assert status_after.status_code == 200
+    assert all(item["name"] != "delete-me.md" for item in status_after.json()["files"])
+
+
+def test_knowledge_batch_delete_files_and_refresh_status(tmp_path: Path) -> None:
+    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-knowledge-batch-delete"
+    client = _build_client(
+        tmp_path,
+        rag_env={
+            "RAG_ENABLED": "true",
+            "RAG_SOURCE_PATH": str(knowledge_dir),
+            "RAG_EMBEDDING_MODEL": "local-hash-v1",
+        },
+    )
+
+    first = client.post(
+        "/api/knowledge/upload",
+        files={"file": ("first.md", b"# First\n\nalpha", "text/markdown")},
+    )
+    second = client.post(
+        "/api/knowledge/upload",
+        files={"file": ("second.md", b"# Second\n\nbeta", "text/markdown")},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert (knowledge_dir / "first.md").exists()
+    assert (knowledge_dir / "second.md").exists()
+
+    batch_delete = client.post(
+        "/api/knowledge/files/delete-batch",
+        json={"relative_paths": ["first.md", "second.md"]},
+    )
+    assert batch_delete.status_code == 200
+    body = batch_delete.json()
+    assert body["index_ready"] is True
+    assert all(item["name"] not in {"first.md", "second.md"} for item in body["files"])
+    assert not (knowledge_dir / "first.md").exists()
+    assert not (knowledge_dir / "second.md").exists()
+
+
+def test_knowledge_lookup_returns_structured_arcade_candidates(tmp_path: Path) -> None:
+    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-knowledge-lookup-arcades"
+    client = _build_client(
+        tmp_path,
+        rag_env={
+            "RAG_ENABLED": "true",
+            "RAG_SOURCE_PATH": str(knowledge_dir),
+            "RAG_EMBEDDING_MODEL": "local-hash-v1",
+        },
+    )
+
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    (knowledge_dir / "arcades.jsonl").write_text(
+        json.dumps(
+            {
+                "title": "星际传奇人民广场店",
+                "source_type": "arcade_knowledge",
+                "shop_name": "星际传奇人民广场店",
+                "address": "上海市黄浦区人民广场地铁站附近",
+                "province_name": "上海市",
+                "city_name": "上海市",
+                "county_name": "黄浦区",
+                "transport": "近人民广场地铁站",
+                "longitude_gcj02": 121.473701,
+                "latitude_gcj02": 31.230416,
+                "content": "这家机厅在人民广场附近，交通方便，热门时段人会比较多。",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    lookup = client.get("/api/knowledge/lookup", params={"q": "星际传奇人民广场店", "top_k": 3})
+
+    assert lookup.status_code == 200
+    body = lookup.json()
+    assert body["status"] == "completed"
+    assert len(body["hits"]) >= 1
+    assert len(body["arcade_candidates"]) == 1
+    candidate = body["arcade_candidates"][0]
+    assert candidate["name"] == "星际传奇人民广场店"
+    assert candidate["address"] == "上海市黄浦区人民广场地铁站附近"
+    assert candidate["transport"] == "近人民广场地铁站"
+    assert candidate["geo"]["gcj02"]["lng"] == 121.473701
+    assert candidate["geo"]["gcj02"]["lat"] == 31.230416
+
+
+def test_knowledge_lookup_returns_structured_arcade_candidates_from_document_text(tmp_path: Path) -> None:
+    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-knowledge-lookup-doc-text"
+    client = _build_client(
+        tmp_path,
+        rag_env={
+            "RAG_ENABLED": "true",
+            "RAG_SOURCE_PATH": str(knowledge_dir),
+            "RAG_EMBEDDING_MODEL": "local-hash-v1",
+        },
+    )
+
+    knowledge_dir.mkdir(parents=True, exist_ok=True)
+    (knowledge_dir / "arcades.md").write_text(
+        "\n".join(
+            [
+                "机厅名：星际传奇人民广场店",
+                "地址：上海市黄浦区人民广场地铁站附近",
+                "城市：上海市",
+                "区县：黄浦区",
+                "交通：近人民广场地铁站",
+                "备注：晚高峰排队明显。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    lookup = client.get("/api/knowledge/lookup", params={"q": "星际传奇人民广场店", "top_k": 3})
+
+    assert lookup.status_code == 200
+    body = lookup.json()
+    assert body["status"] == "completed"
+    assert len(body["arcade_candidates"]) == 1
+    candidate = body["arcade_candidates"][0]
+    assert candidate["name"] == "星际传奇人民广场店"
+    assert candidate["address"] == "上海市黄浦区人民广场地铁站附近"
+    assert candidate["city_name"] == "上海市"
 
 
 def test_arcade_list_enriches_geo_and_writes_cache(tmp_path: Path) -> None:

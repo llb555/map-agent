@@ -136,6 +136,50 @@ def test_context_builder_injects_route_block_before_shop_details(tmp_path: Path)
     assert '"reading_order": ["route", "search_catalog", "shop_details"]' in context.instructions
 
 
+def test_context_builder_injects_knowledge_hits_block(tmp_path: Path) -> None:
+    prompt_root = tmp_path / "prompts"
+    skill_root = tmp_path / "skills"
+    prompt_root.mkdir()
+    skill_root.mkdir()
+    (prompt_root / "system_base.md").write_text("base prompt", encoding="utf-8")
+    (prompt_root / "main_agent.md").write_text("main prompt", encoding="utf-8")
+    (skill_root / "response_composition.md").write_text("response skill", encoding="utf-8")
+
+    builder = ContextBuilder(
+        prompt_root=prompt_root,
+        skill_root=skill_root,
+        history_turn_limit=6,
+    )
+    state = AgentSessionState(session_id="s_knowledge", active_subagent="main_agent")
+    state.working_memory["last_knowledge_query"] = {"text": "这家店评论怎么样", "top_k": 2}
+    state.working_memory["artifacts"] = {
+        "knowledge_hits": [
+            {
+                "title": "Gamma Arcade 评论",
+                "source_uri": "knowledge://gamma",
+                "source_type": "jsonl",
+                "score": 0.93,
+                "snippet": "资料里提到机器维护不错，晚上人会多一点。",
+            }
+        ]
+    }
+
+    context = builder.build(
+        session_state=state,
+        request=ChatRequest(message="Gamma Arcade 评论怎么样"),
+        subagent=SubAgentProfile(
+            name="main_agent",
+            prompt_file="main_agent.md",
+            allowed_tools=[],
+            skill_files=["response_composition.md"],
+        ),
+    )
+
+    assert '"knowledge_hits"' in context.instructions
+    assert '"title": "Gamma Arcade 评论"' in context.instructions
+    assert '"snippet": "资料里提到机器维护不错，晚上人会多一点。"' in context.instructions
+
+
 def test_context_builder_exposes_last_mcp_result_in_runtime_hint(tmp_path: Path) -> None:
     prompt_root = tmp_path / "prompts"
     skill_root = tmp_path / "skills"
@@ -258,6 +302,37 @@ def test_context_builder_includes_recent_tool_results_history(tmp_path: Path) ->
     assert '"status": "failed"' in context.instructions
     assert '"arguments": {"keywords": "虹口足球场"}' in context.instructions
     assert 'ENGINE_RESPONSE_DATA_ERROR' in context.instructions
+
+
+def test_context_builder_can_build_search_worker_prompt_with_location_resolve_tool(tmp_path: Path) -> None:
+    prompt_root = tmp_path / "prompts"
+    skill_root = tmp_path / "skills"
+    prompt_root.mkdir()
+    skill_root.mkdir()
+    (prompt_root / "system_base.md").write_text("base prompt", encoding="utf-8")
+    (prompt_root / "search_worker.md").write_text("search worker prompt", encoding="utf-8")
+    (skill_root / "search_result_reading.md").write_text("search skill", encoding="utf-8")
+
+    builder = ContextBuilder(
+        prompt_root=prompt_root,
+        skill_root=skill_root,
+        history_turn_limit=6,
+    )
+    state = AgentSessionState(session_id="s_search_worker", active_subagent="search_worker")
+
+    context = builder.build(
+        session_state=state,
+        request=ChatRequest(message="大雁塔附近的机厅"),
+        subagent=SubAgentProfile(
+            name="search_worker",
+            prompt_file="search_worker.md",
+            allowed_tools=["db_query_tool", "location_resolve_tool", "mcp__*"],
+            skill_files=["search_result_reading.md"],
+        ),
+    )
+
+    assert "search worker prompt" in context.instructions
+    assert "search skill" in context.instructions
 
 
 def test_context_builder_main_agent_sees_worker_tool_history(tmp_path: Path) -> None:

@@ -8,6 +8,8 @@ model_pointer: task
 allowed_tools_mode: replace
 allowed_tools:
   - db_query_tool
+  - location_resolve_tool
+  - knowledge_search_tool
   - mcp__*
 skill_files:
   - search_result_reading.md

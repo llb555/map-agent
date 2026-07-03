@@ -13,6 +13,7 @@ from uuid import uuid4
 from app.agent.context.context_builder import ContextBuilder
 from app.agent.events.replay_buffer import ReplayBuffer
 from app.agent.llm.provider_adapter import ProviderAdapter
+from app.agent.llm.provider_router import ProviderRouter
 from app.agent.runtime.loop_guard import LoopGuard
 from app.agent.runtime.session_state import (
     AgentSessionState,
@@ -120,7 +121,7 @@ class ReactRuntime:
         context_builder: ContextBuilder,
         subagent_builder: SubAgentBuilder,
         tool_registry: ToolRegistry,
-        provider_adapter: ProviderAdapter,
+        provider_adapter: ProviderAdapter | ProviderRouter,
         session_store: SessionStateStore,
         replay_buffer: ReplayBuffer,
         arcade_payload_mapper: ArcadePayloadMapper,
@@ -211,6 +212,12 @@ class ReactRuntime:
         if request.shop_id is not None:
             state.working_memory["last_shop_id"] = request.shop_id
         state.working_memory["keyword"] = request.keyword or _extract_keyword(request.message)
+        if request.attachments:
+            set_working_memory_artifact(
+                state.working_memory,
+                "last_attachments",
+                [item.model_dump(mode="json", exclude={"extracted_text", "image_data_url"}) for item in request.attachments],
+            )
         logger.info(
             "chat.start session_id=%s turn_index=%s intent=%s keyword=%s message=%s",
             session_id,
@@ -224,7 +231,7 @@ class ReactRuntime:
             state,
             AgentTurn(
                 role="user",
-                content=request.message,
+                content=request.message.strip() or "已上传附件",
                 agent="main_agent",
                 scope="conversation",
                 payload=request_payload,
@@ -578,6 +585,16 @@ class ReactRuntime:
                 final_text = model_response.text.strip()
             break
 
+        knowledge_backfilled = await self._maybe_backfill_search_worker_knowledge(
+            session_id=session_id,
+            request=request,
+            worker_profile=worker_profile,
+            worker_state=worker_state,
+            worker_run_id=run_id,
+        )
+        if knowledge_backfilled and not self._memory_shops(worker_state.working_memory):
+            final_text = None
+
         promoted_artifacts = self._promote_worker_artifacts(
             parent_memory=state.working_memory,
             worker_memory=worker_state.working_memory,
@@ -759,10 +776,25 @@ class ReactRuntime:
                 )
             return
 
+        if result.tool_name == "knowledge_search_tool":
+            hits = result.output.get("hits")
+            if isinstance(hits, list):
+                set_working_memory_artifact(memory, "knowledge_hits", hits)
+            query_meta = result.output.get("query")
+            if isinstance(query_meta, dict):
+                memory["last_knowledge_query"] = query_meta
+            return
+
         if result.tool_name == "geo_resolve_tool":
             provider = result.output.get("provider")
             if isinstance(provider, str):
                 memory["provider"] = provider
+            return
+
+        if result.tool_name == "location_resolve_tool":
+            locations = result.output.get("locations")
+            if isinstance(locations, list) and locations:
+                set_working_memory_artifact(memory, "resolved_locations", locations)
             return
 
         if result.tool_name == "route_plan_tool":
@@ -800,10 +832,10 @@ class ReactRuntime:
     def _build_worker_memory_snapshot(self, parent_memory: dict[str, Any]) -> dict[str, Any]:
         memory = ensure_working_memory_shape({})
         parent_memory = ensure_working_memory_shape(parent_memory)
-        for key in ("last_request", "last_shop_id", "keyword", "last_db_query", "provider"):
+        for key in ("last_request", "last_shop_id", "keyword", "last_db_query", "last_knowledge_query", "provider"):
             if key in parent_memory:
                 memory[key] = deepcopy(parent_memory[key])
-        for key in ("shop", "shops", "total", "route", "resolved_locations", "client_location", "destination", "view_payload"):
+        for key in ("shop", "shops", "total", "route", "resolved_locations", "client_location", "destination", "view_payload", "knowledge_hits"):
             value = get_working_memory_artifact(parent_memory, key)
             if value is not None:
                 set_working_memory_artifact(memory, key, value)
@@ -816,7 +848,7 @@ class ReactRuntime:
         worker_memory: dict[str, Any],
     ) -> dict[str, Any]:
         promoted: dict[str, Any] = {}
-        for key in ("shop", "shops", "total", "route", "resolved_locations", "client_location", "destination", "view_payload"):
+        for key in ("shop", "shops", "total", "route", "resolved_locations", "client_location", "destination", "view_payload", "knowledge_hits"):
             value = get_working_memory_artifact(worker_memory, key)
             if value is None:
                 continue
@@ -824,6 +856,8 @@ class ReactRuntime:
             promoted[key] = deepcopy(value)
         if isinstance(worker_memory.get("last_db_query"), dict):
             parent_memory["last_db_query"] = deepcopy(worker_memory["last_db_query"])
+        if isinstance(worker_memory.get("last_knowledge_query"), dict):
+            parent_memory["last_knowledge_query"] = deepcopy(worker_memory["last_knowledge_query"])
         if isinstance(worker_memory.get("provider"), str):
             parent_memory["provider"] = worker_memory["provider"]
         if isinstance(worker_memory.get("keyword"), str):
@@ -831,6 +865,66 @@ class ReactRuntime:
         if isinstance(worker_memory.get("last_mcp_result"), dict):
             parent_memory["last_mcp_result"] = deepcopy(worker_memory["last_mcp_result"])
         return promoted
+
+    async def _maybe_backfill_search_worker_knowledge(
+        self,
+        *,
+        session_id: str,
+        request: ChatRequest,
+        worker_profile: SubAgentProfile,
+        worker_state: AgentSessionState,
+        worker_run_id: str,
+    ) -> bool:
+        if worker_profile.name != "search_worker":
+            return False
+
+        shops = self._memory_shops(worker_state.working_memory)
+        total_raw = get_working_memory_artifact(worker_state.working_memory, "total")
+        total = int(total_raw) if isinstance(total_raw, int) else len(shops)
+        knowledge_hits = get_working_memory_artifact(worker_state.working_memory, "knowledge_hits")
+        if total > 0 or (isinstance(knowledge_hits, list) and knowledge_hits):
+            return False
+
+        query = self._knowledge_fallback_query(worker_state.working_memory, request=request)
+        if not query:
+            return False
+
+        prepared_args, _ = await self._tool_registry.prepare_arguments(
+            tool_name="knowledge_search_tool",
+            raw_arguments={"query": query, "top_k": 4},
+            runtime_context=worker_state.working_memory,
+        )
+        result = await self._tool_registry.execute(
+            call_id=f"call_{uuid4().hex[:10]}",
+            tool_name="knowledge_search_tool",
+            raw_arguments=prepared_args,
+            allowed_tools=worker_profile.allowed_tools,
+        )
+        self._record_tool_result(
+            session_id=session_id,
+            state=worker_state,
+            result=result,
+            agent_name=worker_profile.name,
+            worker_run_id=worker_run_id,
+            tool_arguments=prepared_args,
+            persist=False,
+        )
+        hits = get_working_memory_artifact(worker_state.working_memory, "knowledge_hits")
+        return isinstance(hits, list) and bool(hits)
+
+    def _knowledge_fallback_query(self, memory: dict[str, Any], *, request: ChatRequest) -> str:
+        last_request = memory.get("last_request")
+        if isinstance(last_request, dict):
+            message = str(last_request.get("message") or "").strip()
+            if message:
+                return message
+            keyword = str(last_request.get("keyword") or "").strip()
+            if keyword:
+                return keyword
+        message = str(request.message or "").strip()
+        if message:
+            return message
+        return str(memory.get("keyword") or "").strip()
 
     def _persist_worker_tool_turns(
         self,
@@ -911,6 +1005,8 @@ class ReactRuntime:
             }
 
         shops = self._memory_shops(worker_memory)
+        knowledge_hits = get_working_memory_artifact(worker_memory, "knowledge_hits")
+        knowledge_hit_count = len(knowledge_hits) if isinstance(knowledge_hits, list) else 0
         selected_shop = get_working_memory_artifact(worker_memory, "shop")
         if not isinstance(selected_shop, dict) and shops:
             selected_shop = shops[0]
@@ -918,14 +1014,15 @@ class ReactRuntime:
         total = int(total_raw) if isinstance(total_raw, int) else len(shops)
         query = worker_memory.get("last_db_query") if isinstance(worker_memory.get("last_db_query"), dict) else None
         missing_fields = []
-        if total <= 0 and not query and not str(worker_memory.get("keyword") or "").strip():
+        if total <= 0 and knowledge_hit_count <= 0 and not query and not str(worker_memory.get("keyword") or "").strip():
             missing_fields.append("keyword")
-        status = "failed" if failed_error and total <= 0 else "completed"
+        status = "failed" if failed_error and total <= 0 and knowledge_hit_count <= 0 else "completed"
         if missing_fields and status != "failed":
             status = "needs_input"
         summary = self._build_search_worker_summary(
             total=total,
             shops=shops,
+            knowledge_hit_count=knowledge_hit_count,
             final_text=final_text,
             error=failed_error,
         )
@@ -933,6 +1030,7 @@ class ReactRuntime:
             "summary": summary,
             "total": total,
             "shops": shops,
+            "knowledge_hits": knowledge_hits if isinstance(knowledge_hits, list) else [],
             "selected_shop": selected_shop if isinstance(selected_shop, dict) else None,
             "query": query,
             "needs_clarification": bool(missing_fields),
@@ -956,6 +1054,7 @@ class ReactRuntime:
         *,
         total: int,
         shops: list[dict[str, Any]],
+        knowledge_hit_count: int,
         final_text: str | None,
         error: str | None,
     ) -> str:
@@ -963,6 +1062,11 @@ class ReactRuntime:
             return final_text.strip()
         if error:
             return f"Search worker stopped after an error: {error}"
+        if knowledge_hit_count > 0 and total <= 0:
+            return (
+                "Search worker found no matching arcades in the structured database "
+                f"and retrieved {knowledge_hit_count} knowledge snippets as fallback."
+            )
         if total <= 0:
             return "Search worker found no matching arcades for the current filters."
         top_name = str(shops[0].get("name") or "unknown arcade") if shops else "unknown arcade"
@@ -1008,6 +1112,9 @@ class ReactRuntime:
         if shops_payload:
             top = shops_payload[0]
             return f"我已经找到匹配机厅，先看 {top.get('name') or 'unknown arcade'}。"
+        knowledge_hits = get_working_memory_artifact(state.working_memory, "knowledge_hits")
+        if isinstance(knowledge_hits, list) and knowledge_hits:
+            return "我已经检索到相关知识片段，但总结环节没有产出完整文本，请重试一次。"
         last_error = state.working_memory.get("last_error")
         if isinstance(last_error, dict):
             message = last_error.get("message")

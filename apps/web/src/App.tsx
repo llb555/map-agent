@@ -3,6 +3,7 @@ import { AppSidebar } from "./components/AppSidebar";
 import { AppTopbar } from "./components/AppTopbar";
 import { ArcadeBrowser } from "./components/ArcadeBrowser";
 import { ChatPanel } from "./components/ChatPanel";
+import { KnowledgeManager } from "./components/KnowledgeManager";
 import { useChatSessionController } from "./hooks/useChatSessionController";
 import { readInitialViewMode } from "./lib/viewMode";
 import { useAppStore } from "./stores/appStore";
@@ -28,6 +29,7 @@ export function App() {
         onStartNewSession={chat.startNewSession}
         onOpenChatView={chat.openChatView}
         onOpenArcadesView={chat.openArcadesView}
+        onOpenKnowledgeView={chat.openKnowledgeView}
         onRefresh={chat.refreshSessions}
         onSelectSession={chat.selectSession}
         onDeleteSession={(sessionId) => void chat.removeSession(sessionId)}
@@ -51,8 +53,10 @@ export function App() {
             streamReply={chat.streamReply}
             streamReplyActive={chat.streamReplyActive}
           />
-        ) : (
+        ) : viewMode === "arcades" ? (
           <ArcadeBrowser />
+        ) : (
+          <KnowledgeManager />
         )}
       </main>
     </div>

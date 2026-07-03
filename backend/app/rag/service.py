@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Lock
 from typing import Any
 import hashlib
 import re
 from collections import Counter
+from xml.etree import ElementTree
+from zipfile import BadZipFile, ZipFile
 
 import httpx
 
@@ -177,9 +182,9 @@ class SentenceTransformerEmbeddings:
                 "sentence_transformers_missing: install sentence-transformers and its runtime dependencies"
             ) from exc
         try:
-            self._model = SentenceTransformer(self._model_name)
-        except Exception:
             self._model = SentenceTransformer(self._model_name, local_files_only=True)
+        except Exception:
+            self._model = SentenceTransformer(self._model_name)
 
     @property
     def enabled(self) -> bool:
@@ -367,7 +372,11 @@ class LangChainRAGService:
         self._source_path = self._resolve_source_path(project_root=project_root, source_path=settings.rag_source_path)
         self._chunk_size = max(200, int(settings.rag_chunk_size))
         self._chunk_overlap = max(0, min(int(settings.rag_chunk_overlap), self._chunk_size // 2))
+        self._semantic_chunking_enabled = bool(settings.rag_semantic_chunking_enabled)
         self._top_k = max(1, int(settings.rag_top_k))
+        self._vector_backend = settings.rag_vector_backend
+        self._faiss_index_path = settings.rag_faiss_index_path
+        self._faiss_metadata_path = settings.rag_faiss_metadata_path
         rag_embedding_model = settings.rag_embedding_model.strip()
         if rag_embedding_model.lower() == "local-hash-v1":
             self._embedder = LocalHashEmbeddings()
@@ -408,12 +417,20 @@ class LangChainRAGService:
         self._index_ready = False
         self._chunk_records: list[_ChunkRecord] = []
         self._load_error: str | None = None
+        self._faiss_index: Any | None = None
+        self._supported_suffixes = {".md", ".txt", ".json", ".jsonl", ".pdf", ".docx", ".doc"}
 
     def health(self) -> dict[str, Any]:
         return {
             "enabled": self._enabled,
             "source_path": str(self._source_path),
+            "source_exists": self._source_path.exists(),
+            "source_is_dir": self._source_path.is_dir(),
+            "supported_suffixes": sorted(self._supported_suffixes),
             "embeddings_configured": self._embedder.enabled,
+            "vector_backend": self._vector_backend,
+            "faiss_configured": self._vector_backend == "faiss",
+            "semantic_chunking_enabled": self._semantic_chunking_enabled,
             "reranker_enabled": self._reranker_enabled,
             "reranker_configured": self._reranker is not None and self._reranker.enabled,
             "hybrid_search_enabled": self._hybrid_search_enabled,
@@ -423,6 +440,60 @@ class LangChainRAGService:
             "load_error": self._load_error,
         }
 
+    def rebuild_index(self) -> dict[str, Any]:
+        with self._lock:
+            self._index_ready = False
+            self._chunk_records = []
+            self._load_error = None
+            self._faiss_index = None
+        self._ensure_index_loaded()
+        return self.health()
+
+    def warmup(self) -> dict[str, Any]:
+        if not self._enabled:
+            return self.health()
+        if not self._embedder.enabled:
+            self._load_error = "rag_embeddings_not_configured"
+            return self.health()
+        try:
+            self._ensure_index_loaded()
+        except Exception as exc:
+            self._load_error = str(exc).strip() or type(exc).__name__
+        return self.health()
+
+    def knowledge_directory(self) -> Path:
+        return self._source_path
+
+    def supported_suffixes(self) -> list[str]:
+        return sorted(self._supported_suffixes)
+
+    def list_source_files(self) -> list[dict[str, Any]]:
+        if not self._source_path.exists():
+            return []
+        if self._source_path.is_file():
+            paths = [self._source_path]
+        else:
+            paths = sorted(
+                path
+                for path in self._source_path.rglob("*")
+                if path.is_file() and path.suffix.lower() in self._supported_suffixes
+            )
+        results: list[dict[str, Any]] = []
+        for path in paths:
+            stat = path.stat()
+            results.append(
+                {
+                    "name": path.name,
+                    "relative_path": path.relative_to(self._source_path).as_posix()
+                    if self._source_path.is_dir()
+                    else path.name,
+                    "suffix": path.suffix.lower(),
+                    "size_bytes": stat.st_size,
+                    "updated_at": stat.st_mtime,
+                }
+            )
+        return results
+
     def _hybrid_search(
         self, *, query: str, query_embedding: list[float], top_k: int
     ) -> list[dict[str, Any]]:
@@ -431,10 +502,7 @@ class LangChainRAGService:
             return []
 
         # Vector search scores
-        vector_scores = {
-            idx: self._cosine_similarity(query_embedding, row.embedding)
-            for idx, row in enumerate(self._chunk_records)
-        }
+        vector_scores = self._vector_scores(query_embedding)
 
         # BM25 scores
         bm25_results = self._bm25_index.search(query, top_k=len(self._chunk_records))
@@ -496,7 +564,7 @@ class LangChainRAGService:
         normalized_query = query.strip()
         limit = max(1, min(int(top_k or self._top_k), 8))
         payload = {
-            "backend": "langchain_memory",
+            "backend": f"langchain_{self._vector_backend}",
             "query": {
                 "text": normalized_query,
                 "top_k": limit,
@@ -551,10 +619,7 @@ class LangChainRAGService:
             payload["hybrid_search"] = True
         else:
             # Pure vector search
-            scored = [
-                (self._cosine_similarity(query_embedding, row.embedding), row)
-                for row in self._chunk_records
-            ]
+            scored = self._rank_records_by_vector(query_embedding, top_k=retrieval_limit)
             candidates = [
                 {
                     "chunk_id": row.chunk_id,
@@ -566,7 +631,7 @@ class LangChainRAGService:
                     "text": row.text,
                     "metadata": row.metadata,
                 }
-                for score, row in sorted(scored, key=lambda item: item[0], reverse=True)[:retrieval_limit]
+                for score, row in scored
             ]
             payload["hybrid_search"] = False
 
@@ -599,10 +664,18 @@ class LangChainRAGService:
         with self._lock:
             if self._index_ready:
                 return
+            if self._vector_backend == "faiss" and self._try_restore_faiss_snapshot():
+                if self._hybrid_search_enabled and self._bm25_index is not None and self._chunk_records:
+                    doc_texts = [record.text for record in self._chunk_records]
+                    self._bm25_index.build(doc_texts)
+                self._index_ready = True
+                self._load_error = None
+                return
             documents = self._load_documents()
             chunks = self._split_documents(documents)
             if not chunks:
                 self._chunk_records = []
+                self._refresh_vector_backend([])
                 self._index_ready = True
                 self._load_error = None
                 return
@@ -631,6 +704,7 @@ class LangChainRAGService:
                     )
                 )
             self._chunk_records = records
+            self._refresh_vector_backend(records)
 
             # Build BM25 index if hybrid search is enabled
             if self._hybrid_search_enabled and self._bm25_index is not None and records:
@@ -639,6 +713,172 @@ class LangChainRAGService:
 
             self._index_ready = True
             self._load_error = None
+
+    def _refresh_vector_backend(self, records: list[_ChunkRecord]) -> None:
+        if self._vector_backend != "faiss":
+            self._faiss_index = None
+            self._remove_faiss_sidecar_files()
+            return
+        if not records:
+            self._faiss_index = None
+            self._persist_faiss_sidecar([])
+            return
+        self._build_faiss_index(records)
+
+    def _vector_scores(self, query_embedding: list[float]) -> dict[int, float]:
+        if self._vector_backend == "faiss" and self._faiss_index is not None:
+            return self._faiss_vector_scores(query_embedding)
+        return {
+            idx: self._cosine_similarity(query_embedding, row.embedding)
+            for idx, row in enumerate(self._chunk_records)
+        }
+
+    def _rank_records_by_vector(self, query_embedding: list[float], *, top_k: int) -> list[tuple[float, _ChunkRecord]]:
+        if self._vector_backend == "faiss" and self._faiss_index is not None:
+            return self._faiss_rank_records(query_embedding, top_k=top_k)
+        scored = [
+            (self._cosine_similarity(query_embedding, row.embedding), row)
+            for row in self._chunk_records
+        ]
+        return sorted(scored, key=lambda item: item[0], reverse=True)[:top_k]
+
+    def _build_faiss_index(self, records: list[_ChunkRecord]) -> None:
+        faiss = self._import_faiss()
+        matrix = [list(map(float, row.embedding)) for row in records if row.embedding]
+        if not matrix:
+            self._faiss_index = None
+            self._persist_faiss_sidecar(records)
+            return
+        vectors = self._numpy_float32_matrix(matrix)
+        faiss.normalize_L2(vectors)
+        index = faiss.IndexFlatIP(vectors.shape[1])
+        index.add(vectors)
+        self._faiss_index = index
+        self._persist_faiss_index(index)
+        self._persist_faiss_sidecar(records)
+
+    def _faiss_rank_records(self, query_embedding: list[float], *, top_k: int) -> list[tuple[float, _ChunkRecord]]:
+        scores = self._faiss_vector_scores(query_embedding, top_k=top_k)
+        ranked: list[tuple[float, _ChunkRecord]] = []
+        for idx, score in sorted(scores.items(), key=lambda item: item[1], reverse=True):
+            if 0 <= idx < len(self._chunk_records):
+                ranked.append((score, self._chunk_records[idx]))
+        return ranked
+
+    def _faiss_vector_scores(self, query_embedding: list[float], top_k: int | None = None) -> dict[int, float]:
+        if self._faiss_index is None:
+            return {}
+        faiss = self._import_faiss()
+        limit = max(1, min(top_k or len(self._chunk_records), len(self._chunk_records)))
+        query = self._numpy_float32_matrix([[float(value) for value in query_embedding]])
+        faiss.normalize_L2(query)
+        distances, indices = self._faiss_index.search(query, limit)
+        scores: dict[int, float] = {}
+        if len(indices) == 0:
+            return scores
+        for idx, score in zip(indices[0], distances[0], strict=False):
+            row_id = int(idx)
+            if row_id < 0:
+                continue
+            scores[row_id] = float(score)
+        return scores
+
+    def _persist_faiss_index(self, index: Any) -> None:
+        path = self._faiss_index_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        faiss = self._import_faiss()
+        faiss.write_index(index, str(path))
+
+    def _persist_faiss_sidecar(self, records: list[_ChunkRecord]) -> None:
+        meta_path = self._faiss_metadata_path
+        meta_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "source_signature": self._source_signature(),
+            "records": [
+                {
+                    "chunk_id": row.chunk_id,
+                    "title": row.title,
+                    "source_uri": row.source_uri,
+                    "source_type": row.source_type,
+                    "text": row.text,
+                    "embedding": row.embedding,
+                    "metadata": row.metadata,
+                }
+                for row in records
+            ],
+        }
+        meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _try_restore_faiss_snapshot(self) -> bool:
+        if not self._faiss_index_path.exists() or not self._faiss_metadata_path.exists():
+            return False
+        try:
+            payload = json.loads(self._faiss_metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("source_signature") != self._source_signature():
+            return False
+        raw_records = payload.get("records")
+        if not isinstance(raw_records, list):
+            return False
+        records: list[_ChunkRecord] = []
+        for item in raw_records:
+            if not isinstance(item, dict):
+                continue
+            embedding = item.get("embedding")
+            metadata = item.get("metadata")
+            text = item.get("text")
+            if not isinstance(embedding, list) or not isinstance(metadata, dict) or not isinstance(text, str):
+                continue
+            records.append(
+                _ChunkRecord(
+                    chunk_id=str(item.get("chunk_id") or f"chunk_{len(records) + 1}"),
+                    title=str(item.get("title") or "unknown"),
+                    source_uri=str(item.get("source_uri") or "knowledge://unknown"),
+                    source_type=str(item.get("source_type") or "document"),
+                    text=text,
+                    embedding=[float(value) for value in embedding],
+                    metadata=metadata,
+                )
+            )
+        if not records:
+            return False
+        faiss = self._import_faiss()
+        try:
+            index = faiss.read_index(str(self._faiss_index_path))
+        except Exception:
+            return False
+        self._chunk_records = records
+        self._faiss_index = index
+        return True
+
+    def _remove_faiss_sidecar_files(self) -> None:
+        for path in (self._faiss_index_path, self._faiss_metadata_path):
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                continue
+
+    def _import_faiss(self) -> Any:
+        try:
+            import faiss
+        except ImportError as exc:
+            raise RuntimeError("faiss_missing: install faiss-cpu to enable FAISS vector backend") from exc
+        return faiss
+
+    def _numpy_float32_matrix(self, rows: list[list[float]]) -> Any:
+        try:
+            import numpy as np
+        except ImportError as exc:
+            raise RuntimeError("numpy_missing: install numpy to enable FAISS vector backend") from exc
+        return np.asarray(rows, dtype="float32")
+
+    def _source_signature(self) -> list[dict[str, Any]]:
+        return self.list_source_files()
 
     def _load_documents(self) -> list[Any]:
         document_cls = self._document_class()
@@ -652,7 +892,7 @@ class LangChainRAGService:
             paths = sorted(
                 path
                 for path in self._source_path.rglob("*")
-                if path.is_file() and path.suffix.lower() in {".md", ".txt", ".json", ".jsonl"}
+                if path.is_file() and path.suffix.lower() in {".md", ".txt", ".json", ".jsonl", ".pdf", ".docx", ".doc"}
             )
 
         documents: list[Any] = []
@@ -662,14 +902,13 @@ class LangChainRAGService:
                 text = path.read_text(encoding="utf-8").strip()
                 if not text:
                     continue
-                documents.append(
-                    document_cls(
-                        page_content=text,
-                        metadata={
-                            "title": path.stem,
-                            "source_uri": str(path),
-                            "source_type": suffix.lstrip("."),
-                        },
+                documents.extend(
+                    self._documents_from_labeled_text(
+                        text=text,
+                        source_title=path.stem,
+                        source_uri=str(path),
+                        source_type=suffix.lstrip("."),
+                        document_cls=document_cls,
                     )
                 )
                 continue
@@ -678,8 +917,406 @@ class LangChainRAGService:
                 documents.extend(self._documents_from_jsonl(path=path, document_cls=document_cls))
                 continue
 
+            if suffix == ".pdf":
+                documents.extend(self._documents_from_pdf(path=path, document_cls=document_cls))
+                continue
+
+            if suffix == ".docx":
+                documents.extend(self._documents_from_docx(path=path, document_cls=document_cls))
+                continue
+
+            if suffix == ".doc":
+                documents.extend(self._documents_from_doc(path=path, document_cls=document_cls))
+                continue
+
             documents.extend(self._documents_from_json(path=path, document_cls=document_cls))
         return documents
+
+    def _documents_from_labeled_text(
+        self,
+        *,
+        text: str,
+        source_title: str,
+        source_uri: str,
+        source_type: str,
+        document_cls: Any,
+    ) -> list[Any]:
+        parsed_documents = self._extract_structured_arcade_documents_from_text(
+            text=text,
+            source_title=source_title,
+            source_uri=source_uri,
+            source_type=source_type,
+            document_cls=document_cls,
+        )
+        if parsed_documents:
+            return parsed_documents
+        return [
+            document_cls(
+                page_content=text,
+                metadata={
+                    "title": source_title,
+                    "source_uri": source_uri,
+                    "source_type": source_type,
+                },
+            )
+        ]
+
+    def _extract_structured_arcade_documents_from_text(
+        self,
+        *,
+        text: str,
+        source_title: str,
+        source_uri: str,
+        source_type: str,
+        document_cls: Any,
+    ) -> list[Any]:
+        normalized_text = text.strip()
+        if not normalized_text:
+            return []
+
+        lines = [line.strip() for line in normalized_text.splitlines()]
+        documents: list[Any] = []
+        current: dict[str, str] = {}
+        note_lines: list[str] = []
+
+        def flush_current() -> None:
+            nonlocal current, note_lines
+            name = current.get("shop_name") or current.get("name")
+            address = current.get("address")
+            city_name = current.get("city_name") or current.get("city")
+            province_name = current.get("province_name") or current.get("province")
+            county_name = current.get("county_name") or current.get("district")
+            if not name or not (address or city_name or province_name or county_name):
+                current = {}
+                note_lines = []
+                return
+            content_parts = [
+                f"机厅名：{name}",
+                f"地址：{address}" if address else None,
+                f"省份：{province_name}" if province_name else None,
+                f"城市：{city_name}" if city_name else None,
+                f"区县：{county_name}" if county_name else None,
+                f"交通：{current.get('transport')}" if current.get("transport") else None,
+                f"备注：{' '.join(note_lines).strip()}" if note_lines else None,
+            ]
+            documents.append(
+                document_cls(
+                    page_content="\n".join(part for part in content_parts if part),
+                    metadata={
+                        "title": name,
+                        "source_uri": source_uri,
+                        "source_type": source_type,
+                        "shop_name": name,
+                        "address": address,
+                        "province_name": province_name,
+                        "city_name": city_name,
+                        "county_name": county_name,
+                        "transport": current.get("transport"),
+                    },
+                )
+            )
+            current = {}
+            note_lines = []
+
+        label_aliases = {
+            "机厅名": "shop_name",
+            "店名": "shop_name",
+            "场馆名": "shop_name",
+            "门店名": "shop_name",
+            "shop_name": "shop_name",
+            "name": "shop_name",
+            "地址": "address",
+            "详细地址": "address",
+            "address": "address",
+            "省": "province_name",
+            "省份": "province_name",
+            "province": "province_name",
+            "province_name": "province_name",
+            "市": "city_name",
+            "城市": "city_name",
+            "city": "city_name",
+            "city_name": "city_name",
+            "区": "county_name",
+            "区县": "county_name",
+            "县区": "county_name",
+            "district": "county_name",
+            "county_name": "county_name",
+            "交通": "transport",
+            "到达方式": "transport",
+            "transport": "transport",
+            "备注": "note",
+            "说明": "note",
+            "content": "note",
+            "正文": "note",
+        }
+
+        for raw_line in lines:
+            if not raw_line:
+                if current and note_lines:
+                    note_lines.append("")
+                continue
+            line = raw_line.lstrip("-*0123456789. ").strip()
+            if not line:
+                continue
+            match = re.match(r"^(?P<label>[^:：|]{1,20})[:：|]\s*(?P<value>.+)$", line)
+            if match:
+                raw_label = match.group("label").strip().lower()
+                value = match.group("value").strip()
+                field = label_aliases.get(raw_label)
+                if field == "shop_name":
+                    if current.get("shop_name") and any(
+                        current.get(key) for key in ("address", "province_name", "city_name", "county_name", "transport")
+                    ):
+                        flush_current()
+                    current["shop_name"] = value
+                    continue
+                if field in {"address", "province_name", "city_name", "county_name", "transport"}:
+                    current[field] = value
+                    continue
+                if field == "note":
+                    note_lines.append(value)
+                    continue
+            if "|" in line:
+                cells = [cell.strip() for cell in line.split("|") if cell.strip()]
+                if len(cells) >= 2:
+                    mapped_any = False
+                    for index in range(0, len(cells) - 1, 2):
+                        raw_label = cells[index].strip().lower()
+                        value = cells[index + 1].strip()
+                        field = label_aliases.get(raw_label)
+                        if field == "shop_name":
+                            if current.get("shop_name") and any(
+                                current.get(key) for key in ("address", "province_name", "city_name", "county_name", "transport")
+                            ):
+                                flush_current()
+                            current["shop_name"] = value
+                            mapped_any = True
+                        elif field in {"address", "province_name", "city_name", "county_name", "transport"}:
+                            current[field] = value
+                            mapped_any = True
+                        elif field == "note":
+                            note_lines.append(value)
+                            mapped_any = True
+                    if mapped_any:
+                        continue
+            if current:
+                note_lines.append(line)
+
+        if current:
+            flush_current()
+        return documents
+
+    def _documents_from_pdf(self, *, path: Path, document_cls: Any) -> list[Any]:
+        try:
+            from pypdf import PdfReader
+        except ImportError as exc:  # pragma: no cover - depends on local env
+            raise RuntimeError("pypdf_missing: install pypdf to enable PDF knowledge sources") from exc
+
+        try:
+            reader = PdfReader(str(path))
+        except Exception as exc:
+            raise RuntimeError(f"pdf_read_failed:{path}:{exc}") from exc
+
+        documents: list[Any] = []
+        for page_number, page in enumerate(reader.pages, start=1):
+            try:
+                text = str(page.extract_text() or "").strip()
+            except Exception as exc:
+                raise RuntimeError(f"pdf_text_extract_failed:{path}:page_{page_number}:{exc}") from exc
+            if not text:
+                continue
+            documents.extend(
+                self._documents_from_labeled_text(
+                    text=text,
+                    source_title=f"{path.stem} - page {page_number}",
+                    source_uri=f"{path}#page={page_number}",
+                    source_type="pdf",
+                    document_cls=document_cls,
+                )
+            )
+        return documents
+
+    def _documents_from_docx(self, *, path: Path, document_cls: Any) -> list[Any]:
+        try:
+            with ZipFile(path) as archive:
+                parts = self._extract_docx_parts(archive=archive, path=path)
+        except BadZipFile as exc:
+            raise RuntimeError(f"docx_read_failed:{path}:invalid_zip") from exc
+        except OSError as exc:
+            raise RuntimeError(f"docx_read_failed:{path}:{exc}") from exc
+
+        text = self._compose_docx_text(parts=parts)
+        if not text:
+            return []
+        return self._documents_from_labeled_text(
+            text=text,
+            source_title=path.stem,
+            source_uri=str(path),
+            source_type="docx",
+            document_cls=document_cls,
+        )
+
+    def _documents_from_doc(self, *, path: Path, document_cls: Any) -> list[Any]:
+        with TemporaryDirectory(prefix="rag-doc-convert-") as temp_dir:
+            converted_path = self._convert_doc_to_docx(path=path, output_dir=Path(temp_dir))
+            documents = self._documents_from_docx(path=converted_path, document_cls=document_cls)
+
+        normalized_documents: list[Any] = []
+        for document in documents:
+            metadata = dict(getattr(document, "metadata", {}) or {})
+            metadata["title"] = path.stem
+            metadata["source_uri"] = str(path)
+            metadata["source_type"] = "doc"
+            normalized_documents.append(
+                document_cls(
+                    page_content=str(getattr(document, "page_content", "")),
+                    metadata=metadata,
+                )
+            )
+        return normalized_documents
+
+    def _convert_doc_to_docx(self, *, path: Path, output_dir: Path) -> Path:
+        soffice_path = shutil.which("soffice")
+        if soffice_path:
+            result = subprocess.run(
+                [soffice_path, "--headless", "--convert-to", "docx", "--outdir", str(output_dir), str(path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            converted_path = output_dir / f"{path.stem}.docx"
+            if result.returncode == 0 and converted_path.exists():
+                return converted_path
+
+        textutil_path = shutil.which("textutil")
+        if textutil_path:
+            converted_path = output_dir / f"{path.stem}.docx"
+            result = subprocess.run(
+                [textutil_path, "-convert", "docx", "-output", str(converted_path), str(path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0 and converted_path.exists():
+                return converted_path
+
+        if soffice_path or textutil_path:
+            raise RuntimeError(f"doc_conversion_failed:{path}")
+        raise RuntimeError("doc_conversion_tool_missing: install soffice/libreoffice or use macOS textutil")
+
+    def _extract_docx_parts(self, *, archive: ZipFile, path: Path) -> dict[str, list[str]]:
+        part_sections: dict[str, list[str]] = {
+            "body": [],
+            "headers": [],
+            "footers": [],
+            "comments": [],
+        }
+
+        document_root = self._read_docx_xml_part(archive=archive, part_name="word/document.xml", path=path)
+        body = next((child for child in list(document_root) if self._xml_local_name(child.tag) == "body"), None)
+        if body is None:
+            raise RuntimeError(f"docx_document_body_missing:{path}")
+        part_sections["body"] = self._docx_collect_block_texts(body)
+
+        for header_name in sorted(name for name in archive.namelist() if re.fullmatch(r"word/header\d+\.xml", name)):
+            header_root = self._read_docx_xml_part(archive=archive, part_name=header_name, path=path)
+            part_sections["headers"].extend(self._docx_collect_block_texts(header_root))
+
+        for footer_name in sorted(name for name in archive.namelist() if re.fullmatch(r"word/footer\d+\.xml", name)):
+            footer_root = self._read_docx_xml_part(archive=archive, part_name=footer_name, path=path)
+            part_sections["footers"].extend(self._docx_collect_block_texts(footer_root))
+
+        if "word/comments.xml" in archive.namelist():
+            comments_root = self._read_docx_xml_part(archive=archive, part_name="word/comments.xml", path=path)
+            part_sections["comments"] = self._docx_collect_comment_texts(comments_root)
+
+        return part_sections
+
+    def _compose_docx_text(self, *, parts: dict[str, list[str]]) -> str:
+        sections: list[str] = []
+        if parts.get("body"):
+            sections.append("\n\n".join(parts["body"]).strip())
+        if parts.get("headers"):
+            sections.append("Headers:\n" + "\n".join(parts["headers"]).strip())
+        if parts.get("footers"):
+            sections.append("Footers:\n" + "\n".join(parts["footers"]).strip())
+        if parts.get("comments"):
+            sections.append("Comments:\n" + "\n".join(parts["comments"]).strip())
+        return "\n\n".join(section for section in sections if section.strip()).strip()
+
+    def _read_docx_xml_part(self, *, archive: ZipFile, part_name: str, path: Path) -> ElementTree.Element:
+        try:
+            raw_part = archive.read(part_name)
+        except KeyError as exc:
+            raise RuntimeError(f"docx_part_missing:{path}:{part_name}") from exc
+
+        try:
+            return ElementTree.fromstring(raw_part)
+        except ElementTree.ParseError as exc:
+            raise RuntimeError(f"docx_xml_parse_failed:{path}:{part_name}:{exc}") from exc
+
+    def _docx_collect_comment_texts(self, root: ElementTree.Element) -> list[str]:
+        comments: list[str] = []
+        namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        for comment in list(root):
+            if self._xml_local_name(comment.tag) != "comment":
+                continue
+            author = str(comment.attrib.get(f"{namespace}author") or "").strip()
+            text = "\n".join(self._docx_collect_block_texts(comment)).strip()
+            if not text:
+                continue
+            comments.append(f"{author}: {text}" if author else text)
+        return comments
+
+    def _docx_collect_block_texts(self, container: ElementTree.Element) -> list[str]:
+        lines: list[str] = []
+        for child in list(container):
+            local_name = self._xml_local_name(child.tag)
+            if local_name == "p":
+                paragraph_text = self._docx_extract_paragraph_text(child)
+                if paragraph_text:
+                    lines.append(paragraph_text)
+                continue
+            if local_name == "tbl":
+                table_text = self._docx_extract_table_text(child)
+                if table_text:
+                    lines.append(table_text)
+                continue
+        return lines
+
+    def _docx_extract_paragraph_text(self, paragraph: ElementTree.Element) -> str:
+        pieces: list[str] = []
+        for node in paragraph.iter():
+            local_name = self._xml_local_name(node.tag)
+            if local_name == "t":
+                pieces.append(node.text or "")
+            elif local_name == "tab":
+                pieces.append("\t")
+            elif local_name in {"br", "cr"}:
+                pieces.append("\n")
+        text = "".join(pieces)
+        lines = [line.strip() for line in text.splitlines()]
+        return "\n".join(line for line in lines if line).strip()
+
+    def _docx_extract_table_text(self, table: ElementTree.Element) -> str:
+        rows: list[str] = []
+        for row in list(table):
+            if self._xml_local_name(row.tag) != "tr":
+                continue
+            cells: list[str] = []
+            for cell in list(row):
+                if self._xml_local_name(cell.tag) != "tc":
+                    continue
+                cell_lines = self._docx_collect_block_texts(cell)
+                cell_text = " / ".join(line for line in cell_lines if line).strip()
+                if cell_text:
+                    cells.append(cell_text)
+            if cells:
+                rows.append(" | ".join(cells))
+        return "\n".join(rows).strip()
+
+    def _xml_local_name(self, tag: str) -> str:
+        return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
     def _documents_from_jsonl(self, *, path: Path, document_cls: Any) -> list[Any]:
         documents: list[Any] = []
@@ -749,6 +1386,41 @@ class LangChainRAGService:
         metadata["title"] = str(payload.get("title") or payload.get("name") or default_title)
         metadata["source_uri"] = str(payload.get("source_uri") or payload.get("source") or source_uri)
         metadata["source_type"] = str(payload.get("source_type") or source_type)
+
+        explicit_name = payload.get("shop_name") or payload.get("name")
+        explicit_address = payload.get("address")
+        explicit_province = payload.get("province_name") or payload.get("province")
+        explicit_city = payload.get("city_name") or payload.get("city")
+        explicit_county = payload.get("county_name") or payload.get("district")
+        explicit_transport = payload.get("transport")
+
+        if any(value not in (None, "") for value in (explicit_name, explicit_address, explicit_province, explicit_city, explicit_county, explicit_transport)):
+            metadata.setdefault("shop_name", str(explicit_name).strip() if explicit_name not in (None, "") else None)
+            metadata.setdefault("address", str(explicit_address).strip() if explicit_address not in (None, "") else None)
+            metadata.setdefault("province_name", str(explicit_province).strip() if explicit_province not in (None, "") else None)
+            metadata.setdefault("city_name", str(explicit_city).strip() if explicit_city not in (None, "") else None)
+            metadata.setdefault("county_name", str(explicit_county).strip() if explicit_county not in (None, "") else None)
+            metadata.setdefault("transport", str(explicit_transport).strip() if explicit_transport not in (None, "") else None)
+            return document_cls(page_content=content.strip(), metadata=metadata)
+
+        parsed_documents = self._extract_structured_arcade_documents_from_text(
+            text=content.strip(),
+            source_title=str(metadata["title"]),
+            source_uri=str(metadata["source_uri"]),
+            source_type=str(metadata["source_type"]),
+            document_cls=document_cls,
+        )
+        if parsed_documents:
+            if len(parsed_documents) == 1:
+                parsed = parsed_documents[0]
+                parsed_metadata = dict(getattr(parsed, "metadata", {}) or {})
+                parsed_metadata.update({key: value for key, value in metadata.items() if key not in parsed_metadata})
+                return document_cls(
+                    page_content=str(getattr(parsed, "page_content", "")).strip(),
+                    metadata=parsed_metadata,
+                )
+            return document_cls(page_content=content.strip(), metadata=metadata)
+
         return document_cls(page_content=content.strip(), metadata=metadata)
 
     def _split_documents(self, documents: list[Any]) -> list[Any]:
@@ -757,6 +1429,10 @@ class LangChainRAGService:
         if self._langchain_available():
             from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+            semantic_chunks = self._split_documents_semantically(documents)
+            if semantic_chunks is not None:
+                return semantic_chunks
+
             splitter = RecursiveCharacterTextSplitter(
                 chunk_size=self._chunk_size,
                 chunk_overlap=self._chunk_overlap,
@@ -764,6 +1440,22 @@ class LangChainRAGService:
             )
             return splitter.split_documents(documents)
         return self._split_documents_locally(documents)
+
+    def _split_documents_semantically(self, documents: list[Any]) -> list[Any] | None:
+        if not self._semantic_chunking_enabled:
+            return None
+        try:
+            from langchain_experimental.text_splitter import SemanticChunker
+        except ImportError:
+            return None
+        try:
+            splitter = SemanticChunker(
+                embeddings=self._embedder,
+                breakpoint_threshold_type="percentile",
+            )
+            return splitter.split_documents(documents)
+        except Exception:
+            return None
 
     def _ensure_langchain_dependencies(self) -> None:
         try:

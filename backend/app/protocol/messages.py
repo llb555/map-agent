@@ -157,6 +157,78 @@ class RegionItemDto(BaseModel):
     name: str
 
 
+class KnowledgeFileItemDto(BaseModel):
+    """One knowledge source file currently visible to RAG."""
+
+    name: str
+    relative_path: str
+    suffix: str
+    size_bytes: int
+    updated_at: float
+
+
+class KnowledgeStatusDto(BaseModel):
+    """Knowledge base management/status payload."""
+
+    directory: str
+    enabled: bool
+    source_exists: bool
+    source_is_dir: bool
+    supported_suffixes: list[str]
+    semantic_chunking_enabled: bool
+    reranker_enabled: bool
+    hybrid_search_enabled: bool
+    index_ready: bool
+    chunk_count: int
+    load_error: str | None = None
+    files: list[KnowledgeFileItemDto] = Field(default_factory=list)
+
+
+class KnowledgeUploadResponseDto(BaseModel):
+    """Upload result for one knowledge file."""
+
+    file: KnowledgeFileItemDto
+    rag: KnowledgeStatusDto
+
+
+class KnowledgeLookupHitDto(BaseModel):
+    """One lightweight knowledge hit for browser-side fallback messaging."""
+
+    title: str | None = None
+    source_uri: str | None = None
+    source_type: str | None = None
+    score: float | None = None
+    snippet: str | None = None
+
+
+class KnowledgeArcadeCandidateDto(BaseModel):
+    """Structured arcade candidate parsed from a knowledge-base hit."""
+
+    id: str
+    name: str
+    address: str | None = None
+    region_text: str | None = None
+    province_name: str | None = None
+    city_name: str | None = None
+    county_name: str | None = None
+    transport: str | None = None
+    source_uri: str | None = None
+    source_type: str | None = None
+    score: float | None = None
+    geo: ArcadeGeoDto | None = None
+
+
+class KnowledgeLookupResponseDto(BaseModel):
+    """Knowledge lookup response used by the arcade browser fallback flow."""
+
+    query: str
+    status: str
+    total_hits: int = 0
+    hits: list[KnowledgeLookupHitDto] = Field(default_factory=list)
+    arcade_candidates: list[KnowledgeArcadeCandidateDto] = Field(default_factory=list)
+
+
+
 class RouteSummaryDto(BaseModel):
     """Route plan payload returned by navigation flow."""
 
@@ -184,12 +256,24 @@ class RouteSummaryDto(BaseModel):
         return payload
 
 
+class ChatAttachmentDto(BaseModel):
+    """One uploaded attachment accompanying a chat turn."""
+
+    name: str = Field(..., min_length=1, max_length=256)
+    mime_type: str = Field(..., min_length=1, max_length=128)
+    size_bytes: int = Field(default=0, ge=0, le=10 * 1024 * 1024)
+    kind: Literal["image", "document"]
+    preview_text: str | None = Field(default=None, max_length=2000)
+    extracted_text: str | None = Field(default=None, exclude=True, max_length=12000)
+    image_data_url: str | None = Field(default=None, exclude=True, max_length=16 * 1024 * 1024)
+
+
 class ChatRequest(BaseModel):
     """Chat entrypoint request used by the orchestrator."""
 
     session_id: str | None = None
     client_id: str | None = Field(default=None, min_length=1, max_length=128)
-    message: str = Field(..., min_length=1, max_length=2000)
+    message: str = Field(default="", max_length=2000)
     intent: IntentType | None = None
     shop_id: int | None = None
     location: ClientLocationContext | None = None
@@ -198,6 +282,13 @@ class ChatRequest(BaseModel):
     city_code: str | None = None
     county_code: str | None = None
     page_size: int = Field(default=5, ge=1, le=50)
+    attachments: list[ChatAttachmentDto] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_message_or_attachments(self) -> "ChatRequest":
+        if self.message.strip() or self.attachments:
+            return self
+        raise ValueError("message_or_attachments_required")
 
 
 class ChatResponse(BaseModel):
@@ -224,6 +315,7 @@ class ChatHistoryTurnDto(BaseModel):
     content: str
     name: str | None = None
     call_id: str | None = None
+    payload: dict[str, Any] | None = None
     created_at: str
 
 

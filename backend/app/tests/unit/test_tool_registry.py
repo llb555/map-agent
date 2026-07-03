@@ -12,6 +12,7 @@ from app.agent.tools.builtin import BuiltinToolProvider
 from app.agent.tools.mcp_gateway import MCPServerConfig, MCPToolGateway
 from app.agent.tools.permission import ToolPermissionChecker
 from app.agent.tools.registry import ToolRegistry
+from app.core.config import Settings
 from app.infra.db.local_store import LocalArcadeStore
 
 
@@ -45,6 +46,7 @@ def _build_registry(
     tmp_path: Path,
     *,
     mcp_tool_gateway: MCPToolGateway | None = None,
+    extra_runtime_services: dict[str, object] | None = None,
 ) -> ToolRegistry:
     data_path = tmp_path / "shops.jsonl"
     _write_rows(data_path)
@@ -56,6 +58,8 @@ def _build_registry(
                 runtime_services={
                     "store": store,
                     "mcp_tool_gateway": gateway,
+                    "settings": Settings(),
+                    **(extra_runtime_services or {}),
                 }
             ),
             gateway,
@@ -139,6 +143,45 @@ def test_tool_registry_can_lookup_one_shop(tmp_path: Path) -> None:
     ))
     assert result.status == "completed"
     assert result.output["shop"]["source_id"] == 1
+
+
+def test_tool_registry_can_resolve_named_place_without_mcp_geocode(tmp_path: Path) -> None:
+    class _StubResolver:
+        def geocode_one(self, raw: dict[str, object]):
+            from app.protocol.messages import ArcadeGeoDto, GeoPoint
+
+            assert raw["name"] == "大雁塔"
+            return ArcadeGeoDto(
+                gcj02=GeoPoint(
+                    lng=108.960987,
+                    lat=34.219447,
+                    coord_system="gcj02",
+                    source="geocode",
+                    precision="approx",
+                ),
+                wgs84=None,
+                source="geocode",
+                precision="approx",
+            )
+
+    registry = _build_registry(
+        tmp_path,
+        extra_runtime_services={"arcade_geo_resolver": _StubResolver()},
+    )
+    result = _run(registry.execute(
+        call_id="c2b",
+        tool_name="location_resolve_tool",
+        raw_arguments={
+            "query": "大雁塔",
+            "city_name": "西安",
+            "county_name": "雁塔区",
+        },
+        allowed_tools=["location_resolve_tool"],
+    ))
+    assert result.status == "completed"
+    assert result.output["provider"] == "amap"
+    assert result.output["locations"][0]["name"] == "大雁塔"
+    assert result.output["locations"][0]["lng"] == 108.960987
 
 
 def test_tool_registry_normalizes_city_name_in_city_code_field(tmp_path: Path) -> None:
@@ -374,10 +417,46 @@ def test_tool_registry_gettools_aggregates_builtin_and_mcp_tools(tmp_path: Path)
     tools = _run(registry.gettools())
 
     assert "db_query_tool" in tools
+    assert "knowledge_search_tool" in tools
     assert tools["db_query_tool"].provider == "builtin"
     assert "mcp__amap__maps_direction_walking" in tools
     assert tools["mcp__amap__maps_direction_walking"].provider == "mcp"
     assert tools["summary_tool"].metadata["prompt"].endswith("response_composition.md")
+
+
+def test_tool_registry_can_execute_knowledge_search_tool(tmp_path: Path) -> None:
+    class _FakeRAGService:
+        def search(self, *, query: str, top_k: int) -> dict[str, object]:
+            return {
+                "status": "completed",
+                "backend": "langchain_memory",
+                "query": {"text": query, "top_k": top_k},
+                "hits": [
+                    {
+                        "title": "Gamma 评论",
+                        "source_uri": "knowledge://gamma",
+                        "source_type": "jsonl",
+                        "score": 0.92,
+                        "snippet": "机器维护不错。",
+                        "metadata": {},
+                    }
+                ],
+            }
+
+    registry = _build_registry(
+        tmp_path,
+        extra_runtime_services={"knowledge_rag_service": _FakeRAGService()},
+    )
+
+    result = _run(registry.execute(
+        call_id="c_knowledge",
+        tool_name="knowledge_search_tool",
+        raw_arguments={"query": "Gamma 评论怎么样", "top_k": 3},
+        allowed_tools=["knowledge_search_tool"],
+    ))
+
+    assert result.status == "completed"
+    assert result.output["hits"][0]["title"] == "Gamma 评论"
 
 
 def test_tool_registry_can_execute_discovered_mcp_tool(tmp_path: Path) -> None:

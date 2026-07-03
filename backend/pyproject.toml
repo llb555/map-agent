@@ -8,10 +8,17 @@ version = "0.1.0"
 description = "Arcadegent FastAPI backend for arcade search and orchestration."
 requires-python = ">=3.11"
 dependencies = [
+  "faiss-cpu>=1.8.0,<2.0.0",
   "fastapi>=0.116.0,<1.0.0",
   "fastmcp>=3.0.0,<4.0.0",
   "httpx>=0.28.0,<1.0.0",
   "jsonschema>=4.0.0,<5.0.0",
+  "langchain>=0.3.0,<0.4.0",
+  "langchain-core>=0.3.0,<0.4.0",
+  "langchain-experimental>=0.3.0,<0.4.0",
+  "langchain-text-splitters>=0.3.0,<0.4.0",
+  "pypdf>=5.0.0,<6.0.0",
+  "sentence-transformers>=3.0.0,<4.0.0",
   "uvicorn[standard]>=0.35.0,<1.0.0",
   "pydantic>=2.10.0,<3.0.0",
   "python-dotenv>=1.1.0,<2.0.0",
@@ -22,6 +29,9 @@ dependencies = [
 dev = [
   "pytest>=8.3.0,<9.0.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

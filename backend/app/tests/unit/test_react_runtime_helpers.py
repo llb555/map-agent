@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 from app.agent.tools.builtin.executors import db_query as db_query_executor
 from app.agent.tools.builtin.executors import summary as summary_executor
 from app.agent.runtime.react_runtime import ReactRuntime, _chunk_stream_text
@@ -16,6 +19,49 @@ from app.agent.tools.registry import ToolExecutionResult
 
 def _runtime() -> ReactRuntime:
     return object.__new__(ReactRuntime)
+
+
+class _FakeToolRegistry:
+    async def prepare_arguments(
+        self,
+        *,
+        tool_name: str,
+        raw_arguments: dict[str, object],
+        runtime_context: dict[str, object] | None = None,
+    ) -> tuple[dict[str, object], list[str]]:
+        return dict(raw_arguments), []
+
+    async def execute(
+        self,
+        *,
+        call_id: str,
+        tool_name: str,
+        raw_arguments: dict[str, object],
+        allowed_tools: list[str],
+    ) -> ToolExecutionResult:
+        assert tool_name == "knowledge_search_tool"
+        return ToolExecutionResult(
+            call_id=call_id,
+            tool_name=tool_name,
+            status="completed",
+            output={
+                "query": {"text": str(raw_arguments.get("query") or ""), "top_k": int(raw_arguments.get("top_k") or 4)},
+                "hits": [
+                    {
+                        "title": "西安 - page 1",
+                        "source_uri": "knowledge://xian",
+                        "source_type": "pdf",
+                        "score": 0.91,
+                        "snippet": "陕西省西安市长安区有机厅游戏大魔方",
+                    }
+                ],
+            },
+        )
+
+
+class _FakeReplayBuffer:
+    def append(self, session_id: str, event: str, payload: object) -> None:
+        return None
 
 
 def test_prepare_tool_arguments_hydrates_search_summary_from_memory() -> None:
@@ -147,15 +193,19 @@ def test_build_worker_memory_snapshot_copies_promotable_artifacts() -> None:
     state = AgentSessionState(session_id="s_snapshot")
     set_working_memory_artifact(state.working_memory, "shops", [{"name": "Alpha"}])
     set_working_memory_artifact(state.working_memory, "route", {"provider": "amap", "mode": "walking"})
+    set_working_memory_artifact(state.working_memory, "knowledge_hits", [{"title": "FAQ", "snippet": "..." }])
     state.working_memory["keyword"] = "maimai"
     state.working_memory["last_db_query"] = {"keyword": "maimai"}
+    state.working_memory["last_knowledge_query"] = {"text": "maimai 新手", "top_k": 4}
 
     worker_memory = runtime._build_worker_memory_snapshot(state.working_memory)
 
     assert get_working_memory_artifact(worker_memory, "shops")[0]["name"] == "Alpha"
     assert get_working_memory_artifact(worker_memory, "route")["mode"] == "walking"
+    assert get_working_memory_artifact(worker_memory, "knowledge_hits")[0]["title"] == "FAQ"
     assert worker_memory["keyword"] == "maimai"
     assert worker_memory["last_db_query"]["keyword"] == "maimai"
+    assert worker_memory["last_knowledge_query"]["text"] == "maimai 新手"
 
 
 def test_prepare_turn_memory_clears_stale_reply() -> None:
@@ -195,6 +245,29 @@ def test_apply_tool_memory_keeps_mcp_resolved_locations() -> None:
 
     assert get_working_memory_artifact(state.working_memory, "resolved_locations")[0]["name"] == "鲁迅公园"
     assert state.working_memory["last_mcp_result"]["tool"] == "maps_geo"
+
+
+def test_apply_tool_memory_keeps_builtin_resolved_locations() -> None:
+    runtime = _runtime()
+    state = AgentSessionState(session_id="s_builtin_geo")
+
+    runtime._apply_tool_memory(
+        state=state,
+        result=ToolExecutionResult(
+            call_id="call_builtin_geo",
+            tool_name="location_resolve_tool",
+            status="completed",
+            output={
+                "provider": "amap",
+                "locations": [
+                    {"name": "大雁塔", "lng": 108.960987, "lat": 34.219447, "coord_system": "gcj02"},
+                ],
+            },
+        ),
+    )
+
+    assert get_working_memory_artifact(state.working_memory, "resolved_locations")[0]["name"] == "大雁塔"
+    assert get_working_memory_artifact(state.working_memory, "resolved_locations")[0]["lng"] == 108.960987
 
 
 def test_promote_worker_artifacts_keeps_last_mcp_result() -> None:
@@ -250,3 +323,72 @@ def test_persist_worker_tool_turns_copies_tool_payload_arguments() -> None:
     assert len(parent_state.turns) == 1
     assert parent_state.turns[0].name == "db_query_tool"
     assert parent_state.turns[0].payload["arguments"]["city_name"] == "上海"
+
+
+def test_apply_tool_memory_keeps_knowledge_hits() -> None:
+    runtime = _runtime()
+    state = AgentSessionState(session_id="s_knowledge")
+
+    runtime._apply_tool_memory(
+        state=state,
+        result=ToolExecutionResult(
+            call_id="call_knowledge",
+            tool_name="knowledge_search_tool",
+            status="completed",
+            output={
+                "query": {"text": "评论怎么样", "top_k": 4},
+                "hits": [
+                    {
+                        "title": "Gamma 评论",
+                        "source_uri": "knowledge://gamma",
+                        "source_type": "jsonl",
+                        "score": 0.88,
+                        "snippet": "机器维护不错。",
+                    }
+                ],
+            },
+        ),
+    )
+
+    assert get_working_memory_artifact(state.working_memory, "knowledge_hits")[0]["title"] == "Gamma 评论"
+    assert state.working_memory["last_knowledge_query"]["text"] == "评论怎么样"
+
+
+def test_search_worker_knowledge_backfill_runs_when_db_is_empty() -> None:
+    runtime = _runtime()
+    runtime._tool_registry = _FakeToolRegistry()
+    runtime._replay_buffer = _FakeReplayBuffer()
+    worker_state = AgentSessionState(session_id="s_worker")
+    set_working_memory_artifact(worker_state.working_memory, "shops", [])
+    set_working_memory_artifact(worker_state.working_memory, "total", 0)
+    worker_state.working_memory["last_request"] = {"message": "西安市长安区是否有机厅"}
+    worker_profile = SimpleNamespace(name="search_worker", allowed_tools=["db_query_tool", "knowledge_search_tool"])
+
+    backfilled = asyncio.run(
+        runtime._maybe_backfill_search_worker_knowledge(
+            session_id="s_worker",
+            request=SimpleNamespace(message="西安市长安区是否有机厅"),
+            worker_profile=worker_profile,
+            worker_state=worker_state,
+            worker_run_id="wrk_1",
+        )
+    )
+
+    assert backfilled is True
+    assert get_working_memory_artifact(worker_state.working_memory, "knowledge_hits")[0]["title"] == "西安 - page 1"
+    assert worker_state.working_memory["last_knowledge_query"]["text"] == "西安市长安区是否有机厅"
+
+
+def test_search_worker_summary_prefers_knowledge_fallback_when_db_is_empty() -> None:
+    runtime = _runtime()
+
+    summary = runtime._build_search_worker_summary(
+        total=0,
+        shops=[],
+        knowledge_hit_count=1,
+        final_text=None,
+        error=None,
+    )
+
+    assert "structured database" in summary
+    assert "knowledge snippets" in summary

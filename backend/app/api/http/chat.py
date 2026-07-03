@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+import base64
+import io
+import json
+from pathlib import Path
+from zipfile import BadZipFile, ZipFile
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 
 from app.agent.runtime.orchestrator import SessionAlreadyRunningError, SessionOwnershipError
 from app.agent.runtime.session_state import AgentSessionState, AgentTurn, get_working_memory_artifact
@@ -11,6 +17,7 @@ from app.core.container import AppContainer
 from app.infra.observability.logger import get_logger
 from app.protocol.messages import (
     ChatHistoryTurnDto,
+    ChatAttachmentDto,
     ChatRequest,
     ChatResponse,
     ChatSessionDispatchDto,
@@ -65,7 +72,154 @@ def _to_turn(turn: AgentTurn) -> ChatHistoryTurnDto:
         content=turn.content,
         name=turn.name,
         call_id=turn.call_id,
+        payload=turn.payload or None,
         created_at=turn.created_at,
+    )
+
+
+def _clip_text(value: str, *, limit: int) -> str:
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 3)].rstrip() + "..."
+
+
+def _extract_text_from_docx_bytes(filename: str, payload: bytes) -> str:
+    try:
+        with ZipFile(io.BytesIO(payload)) as archive:  # type: ignore[name-defined]
+            document = archive.read("word/document.xml")
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=f"attachment_docx_part_missing:{filename}") from exc
+    except BadZipFile as exc:
+        raise HTTPException(status_code=400, detail=f"attachment_docx_invalid:{filename}") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"attachment_docx_read_failed:{filename}:{exc}") from exc
+
+    from xml.etree import ElementTree
+
+    try:
+        root = ElementTree.fromstring(document)
+    except ElementTree.ParseError as exc:
+        raise HTTPException(status_code=400, detail=f"attachment_docx_parse_failed:{filename}") from exc
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    paragraphs: list[str] = []
+    for paragraph in root.findall(".//w:p", namespace):
+        runs = [node.text or "" for node in paragraph.findall(".//w:t", namespace)]
+        text = "".join(runs).strip()
+        if text:
+            paragraphs.append(text)
+    return "\n".join(paragraphs).strip()
+
+
+def _extract_text_from_pdf_bytes(filename: str, payload: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise HTTPException(status_code=400, detail="attachment_pdf_unsupported") from exc
+
+    try:
+        reader = PdfReader(io.BytesIO(payload))  # type: ignore[name-defined]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"attachment_pdf_read_failed:{filename}") from exc
+
+    parts: list[str] = []
+    for page in reader.pages[:8]:
+        try:
+            text = str(page.extract_text() or "").strip()
+        except Exception:
+            text = ""
+        if text:
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _extract_text_from_attachment(filename: str, mime_type: str, payload: bytes) -> str | None:
+    suffix = Path(filename).suffix.lower()
+    if not payload:
+        return None
+    if mime_type.startswith("text/") or suffix in {".md", ".txt", ".json", ".jsonl"}:
+        return payload.decode("utf-8", errors="ignore").strip() or None
+    if suffix == ".docx":
+        return _extract_text_from_docx_bytes(filename, payload) or None
+    if suffix == ".pdf":
+        return _extract_text_from_pdf_bytes(filename, payload) or None
+    return None
+
+
+async def _parse_chat_attachments(files: list[UploadFile]) -> list[ChatAttachmentDto]:
+    attachments: list[ChatAttachmentDto] = []
+    for item in files:
+        filename = Path(item.filename or "").name
+        if not filename:
+            raise HTTPException(status_code=400, detail="attachment_filename_required")
+        payload = await item.read()
+        if not payload:
+            continue
+        if len(payload) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail=f"attachment_too_large:{filename}")
+        mime_type = (item.content_type or "application/octet-stream").strip() or "application/octet-stream"
+        is_image = mime_type.startswith("image/")
+        extracted_text = None if is_image else _extract_text_from_attachment(filename, mime_type, payload)
+        image_data_url = None
+        preview_text: str | None = None
+        if is_image:
+            encoded = base64.b64encode(payload).decode("ascii")
+            image_data_url = f"data:{mime_type};base64,{encoded}"
+            preview_text = f"已附带图片 {filename}"
+        elif extracted_text:
+            preview_text = _clip_text(extracted_text.replace("\r", "\n"), limit=220)
+        else:
+            preview_text = f"已附带文件 {filename}"
+
+        attachments.append(
+            ChatAttachmentDto(
+                name=filename,
+                mime_type=mime_type,
+                size_bytes=len(payload),
+                kind="image" if is_image else "document",
+                preview_text=preview_text,
+                extracted_text=_clip_text(extracted_text or "", limit=12000) if extracted_text else None,
+                image_data_url=image_data_url,
+            )
+        )
+    return attachments
+
+
+def _request_from_form(
+    *,
+    session_id: str | None,
+    client_id: str | None,
+    message: str | None,
+    intent: str | None,
+    shop_id: str | None,
+    location: str | None,
+    keyword: str | None,
+    province_code: str | None,
+    city_code: str | None,
+    county_code: str | None,
+    page_size: str | None,
+    attachments: list[ChatAttachmentDto],
+) -> ChatRequest:
+    location_payload = None
+    if location:
+        try:
+            decoded = json.loads(location)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail="chat_location_invalid_json") from exc
+        location_payload = ClientLocationContext.model_validate(decoded)
+    return ChatRequest(
+        session_id=session_id or None,
+        client_id=client_id or None,
+        message=(message or "").strip(),
+        intent=intent or None,
+        shop_id=int(shop_id) if shop_id else None,
+        location=location_payload,
+        keyword=keyword or None,
+        province_code=province_code or None,
+        city_code=city_code or None,
+        county_code=county_code or None,
+        page_size=int(page_size) if page_size else 5,
+        attachments=attachments,
     )
 
 
@@ -168,6 +322,40 @@ async def chat(
     return response
 
 
+@router.post("/chat/upload", response_model=ChatResponse)
+async def chat_with_upload(
+    session_id: str | None = Form(default=None),
+    client_id: str | None = Form(default=None),
+    message: str | None = Form(default=None),
+    intent: str | None = Form(default=None),
+    shop_id: str | None = Form(default=None),
+    location: str | None = Form(default=None),
+    keyword: str | None = Form(default=None),
+    province_code: str | None = Form(default=None),
+    city_code: str | None = Form(default=None),
+    county_code: str | None = Form(default=None),
+    page_size: str | None = Form(default=None),
+    files: list[UploadFile] = File(default_factory=list),
+    container: AppContainer = Depends(get_container),
+) -> ChatResponse:
+    attachments = await _parse_chat_attachments(files)
+    request = _request_from_form(
+        session_id=session_id,
+        client_id=client_id,
+        message=message,
+        intent=intent,
+        shop_id=shop_id,
+        location=location,
+        keyword=keyword,
+        province_code=province_code,
+        city_code=city_code,
+        county_code=county_code,
+        page_size=page_size,
+        attachments=attachments,
+    )
+    return await chat(request=request, container=container)
+
+
 @router.post(
     "/chat/sessions",
     response_model=ChatSessionDispatchDto,
@@ -191,6 +379,44 @@ async def dispatch_chat_session(
     except SessionOwnershipError as exc:
         raise HTTPException(status_code=404, detail=f"session '{exc.session_id}' not found") from exc
     return ChatSessionDispatchDto(session_id=session_id, status="running")
+
+
+@router.post(
+    "/chat/sessions/upload",
+    response_model=ChatSessionDispatchDto,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def dispatch_chat_session_with_upload(
+    session_id: str | None = Form(default=None),
+    client_id: str | None = Form(default=None),
+    message: str | None = Form(default=None),
+    intent: str | None = Form(default=None),
+    shop_id: str | None = Form(default=None),
+    location: str | None = Form(default=None),
+    keyword: str | None = Form(default=None),
+    province_code: str | None = Form(default=None),
+    city_code: str | None = Form(default=None),
+    county_code: str | None = Form(default=None),
+    page_size: str | None = Form(default=None),
+    files: list[UploadFile] = File(default_factory=list),
+    container: AppContainer = Depends(get_container),
+) -> ChatSessionDispatchDto:
+    attachments = await _parse_chat_attachments(files)
+    request = _request_from_form(
+        session_id=session_id,
+        client_id=client_id,
+        message=message,
+        intent=intent,
+        shop_id=shop_id,
+        location=location,
+        keyword=keyword,
+        province_code=province_code,
+        city_code=city_code,
+        county_code=county_code,
+        page_size=page_size,
+        attachments=attachments,
+    )
+    return await dispatch_chat_session(request=request, container=container)
 
 
 @router.get("/chat/sessions", response_model=list[ChatSessionSummaryDto])

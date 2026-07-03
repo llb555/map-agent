@@ -226,3 +226,71 @@ export async function geocodeAddressToGcj02(
     }
   });
 }
+
+export type AmapGeocodeCandidate = {
+  id: string;
+  name: string;
+  address: string;
+  regionText: string;
+  level?: string | null;
+  point: GeoPoint;
+};
+
+export async function geocodeAddressCandidatesToGcj02(
+  AMap: any,
+  address?: string | null,
+  city?: string | null
+): Promise<AmapGeocodeCandidate[]> {
+  const trimmedAddress = address?.trim();
+  if (!AMap?.Geocoder || !trimmedAddress) {
+    return [];
+  }
+
+  return new Promise<AmapGeocodeCandidate[]>((resolve) => {
+    try {
+      const geocoder = new AMap.Geocoder({
+        city: city?.trim() || undefined
+      });
+      geocoder.getLocation(trimmedAddress, (status: string, result: any) => {
+        if (status !== "complete") {
+          resolve([]);
+          return;
+        }
+        const geocodes = Array.isArray(result?.geocodes) ? result.geocodes : [];
+        const candidates = geocodes
+          .map((item: any, index: number) => {
+            const parsed = parseAmapLngLat(item?.location);
+            if (!parsed) {
+              return null;
+            }
+            const point: GeoPoint = {
+              lng: parsed[0],
+              lat: parsed[1],
+              coord_system: "gcj02",
+              source: "geocode",
+              precision: "approx"
+            };
+            const formattedAddress = typeof item?.formattedAddress === "string" ? item.formattedAddress.trim() : "";
+            const district = typeof item?.district === "string" ? item.district.trim() : "";
+            const cityName = typeof item?.city === "string" ? item.city.trim() : "";
+            const province = typeof item?.province === "string" ? item.province.trim() : "";
+            const regionParts = [province, cityName, district].filter(Boolean);
+            return {
+              id: `${parsed[0].toFixed(6)},${parsed[1].toFixed(6)}-${index}`,
+              name: typeof item?.formattedAddress === "string" && item.formattedAddress.trim()
+                ? item.formattedAddress.trim()
+                : trimmedAddress,
+              address: formattedAddress || [province, cityName, district].filter(Boolean).join(" "),
+              regionText: regionParts.join(" / "),
+              level: typeof item?.level === "string" ? item.level : null,
+              point
+            } satisfies AmapGeocodeCandidate;
+          })
+          .filter((item: AmapGeocodeCandidate | null): item is AmapGeocodeCandidate => Boolean(item));
+        resolve(candidates);
+      });
+    } catch {
+      resolve([]);
+    }
+  });
+}

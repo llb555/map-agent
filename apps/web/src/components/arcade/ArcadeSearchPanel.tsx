@@ -1,6 +1,6 @@
-import { useEffect, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useEffect, useState, type FormEvent, type KeyboardEvent, type ReactElement } from "react";
 import { getArcadeGcjPoint } from "../../lib/amapCoords";
-import { useArcadeBrowserStore } from "../../stores/arcadeBrowserStore";
+import { useArcadeBrowserStore, type SearchFallbackCandidate } from "../../stores/arcadeBrowserStore";
 import type { ArcadeSortBy, ArcadeSummary, SortOrder } from "../../types";
 import { ARCADE_TITLE_OPTIONS } from "./titleOptions";
 
@@ -9,13 +9,15 @@ type ArcadeSearchPanelProps = {
   onSubmit: (event: FormEvent) => Promise<void>;
   onSelectShop: (item: ArcadeSummary) => void;
   onSearchPage: (page: number) => void;
+  onSelectFallbackCandidate: (candidateId: string) => void;
 };
 
 export function ArcadeSearchPanel({
   pageHint,
   onSubmit,
   onSelectShop,
-  onSearchPage
+  onSearchPage,
+  onSelectFallbackCandidate
 }: ArcadeSearchPanelProps) {
   const provinces = useArcadeBrowserStore((state) => state.provinces);
   const cities = useArcadeBrowserStore((state) => state.cities);
@@ -32,6 +34,7 @@ export function ArcadeSearchPanel({
   const error = useArcadeBrowserStore((state) => state.error);
   const paged = useArcadeBrowserStore((state) => state.paged);
   const selectedSourceId = useArcadeBrowserStore((state) => state.selectedSourceId);
+  const searchFallback = useArcadeBrowserStore((state) => state.searchFallback);
   const setShopName = useArcadeBrowserStore((state) => state.setShopName);
   const setTitleName = useArcadeBrowserStore((state) => state.setTitleName);
   const setProvinceCode = useArcadeBrowserStore((state) => state.setProvinceCode);
@@ -40,12 +43,22 @@ export function ArcadeSearchPanel({
   const setHasArcadesOnly = useArcadeBrowserStore((state) => state.setHasArcadesOnly);
   const setSortBy = useArcadeBrowserStore((state) => state.setSortBy);
   const setSortOrder = useArcadeBrowserStore((state) => state.setSortOrder);
+  const setFallbackPage = useArcadeBrowserStore((state) => state.setFallbackPage);
   const totalPages = Math.max(1, paged.total_pages);
   const [pageInput, setPageInput] = useState(String(paged.page));
   const sortHint =
     sortBy === "title_quantity" && titleName
       ? ` | ${titleName} ${sortOrder.toUpperCase()}`
       : "";
+  const fallbackTotalPages = Math.max(
+    1,
+    Math.ceil((searchFallback?.candidates.length ?? 0) / (searchFallback?.pageSize || 1))
+  );
+  const fallbackPage = searchFallback?.page ?? 1;
+  const fallbackCandidates = searchFallback
+    ? searchFallback.candidates.slice((fallbackPage - 1) * searchFallback.pageSize, fallbackPage * searchFallback.pageSize)
+    : [];
+  const hasPagedResults = paged.total_pages > 0;
 
   useEffect(() => {
     setPageInput(String(paged.page));
@@ -75,6 +88,31 @@ export function ArcadeSearchPanel({
     }
   }
 
+  function renderFallbackCandidate(candidate: SearchFallbackCandidate): ReactElement {
+    const active = candidate.id === searchFallback?.selectedCandidateId;
+    return (
+      <li key={candidate.id}>
+        <button
+          type="button"
+          onClick={() => onSelectFallbackCandidate(candidate.id)}
+          className={`browser-item-btn browser-fallback-btn${active ? " is-active" : ""}`}
+          data-testid={`fallback-candidate-${candidate.id}`}
+        >
+          <div className="browser-item-topline">
+            <h3>{candidate.name}</h3>
+            <span className="browser-geo-pill is-ready">{active ? "当前查看" : "可查看"}</span>
+          </div>
+          <p>{candidate.address || "暂无地址"}</p>
+          <small>
+            {candidate.regionText || "地区信息待补充"}
+            {candidate.source === "knowledge" ? " | 知识库候选" : " | 高德候选"}
+            {candidate.level ? ` | ${candidate.level}` : ""}
+          </small>
+        </button>
+      </li>
+    );
+  }
+
   return (
     <section className="browser-card browser-controls">
       <form onSubmit={(event) => void onSubmit(event)} className="browser-filter-grid">
@@ -85,7 +123,7 @@ export function ArcadeSearchPanel({
         <label className="browser-field">
           省份
           <select value={provinceCode} onChange={(e) => setProvinceCode(e.target.value)}>
-            <option value="">全部</option>
+            <option value="">全部（全国）</option>
             {provinces.map((row) => (
               <option value={row.code} key={row.code}>
                 {row.name}
@@ -170,75 +208,133 @@ export function ArcadeSearchPanel({
         </span>
       </div>
 
-      <ul className="browser-result-list">
-        {paged.items.map((item) => {
-          const mapped = Boolean(getArcadeGcjPoint(item));
-          const active = item.source_id === selectedSourceId;
-          const distanceText =
-            typeof item.distance_m === "number"
-              ? item.distance_m >= 1000
-                ? `${(item.distance_m / 1000).toFixed(1)} km`
-                : `${Math.round(item.distance_m)} m`
-              : null;
-          return (
-            <li key={item.source_id}>
+      {!paged.items.length && searchFallback?.message ? (
+        <div className="browser-fallback-block">
+          <div className="browser-detail-note">{searchFallback.message}</div>
+          {searchFallback.candidates.length ? (
+            <>
+              <div className="browser-fallback-header">
+                <strong>高德候选</strong>
+                <span>第 {fallbackPage} / {fallbackTotalPages} 页</span>
+              </div>
+              <ul className="browser-result-list browser-fallback-list">
+                {fallbackCandidates.map((candidate) => renderFallbackCandidate(candidate))}
+              </ul>
+              {searchFallback.candidates.length > searchFallback.pageSize ? (
+                <div className="browser-pager browser-fallback-pager browser-pager-panel">
+                  <div className="browser-page-summary">
+                    <strong>同名候选分页</strong>
+                    <small>共 {searchFallback.candidates.length} 条结果，按页核对后再跳转高德。</small>
+                  </div>
+                  <div className="browser-pager-actions">
+                    <button
+                      type="button"
+                      disabled={fallbackPage <= 1}
+                      onClick={() => setFallbackPage(fallbackPage - 1)}
+                      className="browser-secondary-btn"
+                    >
+                      上一页
+                    </button>
+                    <span className="browser-page-control">第 {fallbackPage} / {fallbackTotalPages} 页</span>
+                    <button
+                      type="button"
+                      disabled={fallbackPage >= fallbackTotalPages}
+                      onClick={() => setFallbackPage(fallbackPage + 1)}
+                      className="browser-secondary-btn"
+                    >
+                      下一页
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+            </>
+          ) : null}
+        </div>
+      ) : null}
+
+      {!searchFallback ? (
+        <>
+          <ul className="browser-result-list">
+            {paged.items.map((item) => {
+              const mapped = Boolean(getArcadeGcjPoint(item));
+              const active = item.source_id === selectedSourceId;
+              const distanceText =
+                typeof item.distance_m === "number"
+                  ? item.distance_m >= 1000
+                    ? `${(item.distance_m / 1000).toFixed(1)} km`
+                    : `${Math.round(item.distance_m)} m`
+                  : null;
+              return (
+                <li key={item.source_id}>
+                  <button
+                    type="button"
+                    onClick={() => onSelectShop(item)}
+                    className={`browser-item-btn${active ? " is-active" : ""}`}
+                    data-testid={`arcade-list-item-${item.source_id}`}
+                  >
+                    <div className="browser-item-topline">
+                      <h3>{item.name}</h3>
+                      <span className={`browser-geo-pill${mapped ? " is-ready" : " is-empty"}`}>
+                        {mapped ? "地图已定位" : "暂无地图定位"}
+                      </span>
+                    </div>
+                    <p>{item.address || "暂无地址"}</p>
+                    <small>
+                      {item.province_name || "-"} / {item.city_name || "-"} / {item.county_name || "-"} | 机种{" "}
+                      {item.arcade_count}
+                      {distanceText ? ` | ${distanceText}` : ""}
+                    </small>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+
+          <div className="browser-pager browser-pager-panel">
+            <div className="browser-page-summary">
+              <strong>结果分页</strong>
+              <small>
+                {hasPagedResults
+                  ? `当前第 ${paged.page} 页，共 ${paged.total_pages} 页，支持直接跳页。`
+                  : "当前没有可分页结果。"}
+              </small>
+            </div>
+            <div className="browser-pager-actions">
               <button
                 type="button"
-                onClick={() => onSelectShop(item)}
-                className={`browser-item-btn${active ? " is-active" : ""}`}
-                data-testid={`arcade-list-item-${item.source_id}`}
+                disabled={paged.page <= 1 || loading}
+                onClick={() => onSearchPage(Math.max(1, paged.page - 1))}
+                className="browser-secondary-btn"
               >
-                <div className="browser-item-topline">
-                  <h3>{item.name}</h3>
-                  <span className={`browser-geo-pill${mapped ? " is-ready" : " is-empty"}`}>
-                    {mapped ? "地图已定位" : "暂无地图定位"}
-                  </span>
-                </div>
-                <p>{item.address || "暂无地址"}</p>
-                <small>
-                  {item.province_name || "-"} / {item.city_name || "-"} / {item.county_name || "-"} | 机种{" "}
-                  {item.arcade_count}
-                  {distanceText ? ` | ${distanceText}` : ""}
-                </small>
+                上一页
               </button>
-            </li>
-          );
-        })}
-      </ul>
-
-      <div className="browser-pager">
-        <button
-          type="button"
-          disabled={paged.page <= 1 || loading}
-          onClick={() => onSearchPage(Math.max(1, paged.page - 1))}
-          className="browser-secondary-btn"
-        >
-          上一页
-        </button>
-        <span className="browser-page-control">
-          第
-          <input
-            aria-label="页码"
-            className="browser-page-input"
-            inputMode="numeric"
-            pattern="[0-9]*"
-            value={pageInput}
-            disabled={loading || paged.total_pages === 0}
-            onChange={(event) => setPageInput(event.target.value.replace(/\D/g, ""))}
-            onBlur={submitPageInput}
-            onKeyDown={onPageInputKeyDown}
-          />
-          / {totalPages} 页
-        </span>
-        <button
-          type="button"
-          disabled={paged.page >= paged.total_pages || loading || paged.total_pages === 0}
-          onClick={() => onSearchPage(paged.page + 1)}
-          className="browser-secondary-btn"
-        >
-          下一页
-        </button>
-      </div>
+              <span className="browser-page-control">
+                第
+                <input
+                  aria-label="页码"
+                  className="browser-page-input"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  value={pageInput}
+                  disabled={loading || paged.total_pages === 0}
+                  onChange={(event) => setPageInput(event.target.value.replace(/\D/g, ""))}
+                  onBlur={submitPageInput}
+                  onKeyDown={onPageInputKeyDown}
+                />
+                / {totalPages} 页
+              </span>
+              <button
+                type="button"
+                disabled={paged.page >= paged.total_pages || loading || paged.total_pages === 0}
+                onClick={() => onSearchPage(paged.page + 1)}
+                className="browser-secondary-btn"
+              >
+                下一页
+              </button>
+            </div>
+          </div>
+        </>
+      ) : null}
     </section>
   );
 }
