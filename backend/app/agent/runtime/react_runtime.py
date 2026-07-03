@@ -27,6 +27,7 @@ from app.agent.runtime.session_state import (
 )
 from app.agent.subagents.subagent_builder import SubAgentBuilder, SubAgentProfile
 from app.agent.tools.registry import ToolExecutionResult, ToolRegistry
+from app.agent.tools.builtin.query_rewrite import rewrite_query
 from app.infra.observability.logger import get_logger
 from app.protocol.messages import (
     ChatRequest,
@@ -212,6 +213,8 @@ class ReactRuntime:
         if request.shop_id is not None:
             state.working_memory["last_shop_id"] = request.shop_id
         state.working_memory["keyword"] = request.keyword or _extract_keyword(request.message)
+        rewritten_query = rewrite_query(request.message)
+        state.working_memory["query_rewrite"] = rewritten_query.to_memory_payload()
         if request.attachments:
             set_working_memory_artifact(
                 state.working_memory,

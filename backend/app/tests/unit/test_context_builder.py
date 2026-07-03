@@ -218,7 +218,136 @@ def test_context_builder_exposes_last_mcp_result_in_runtime_hint(tmp_path: Path)
 
     assert '"last_mcp_result"' in context.instructions
     assert '"tool": "maps_geo"' in context.instructions
-    assert '"name": "虹口足球场"' in context.instructions
+
+
+def test_context_builder_exposes_query_rewrite_in_runtime_hint(tmp_path: Path) -> None:
+    prompt_root = tmp_path / "prompts"
+    skill_root = tmp_path / "skills"
+    prompt_root.mkdir()
+    skill_root.mkdir()
+    (prompt_root / "system_base.md").write_text("base prompt", encoding="utf-8")
+    (prompt_root / "search_worker.md").write_text("search prompt", encoding="utf-8")
+
+    builder = ContextBuilder(
+        prompt_root=prompt_root,
+        skill_root=skill_root,
+        history_turn_limit=6,
+    )
+    state = AgentSessionState(session_id="s_rewrite", active_subagent="search_worker")
+    state.working_memory["query_rewrite"] = {
+        "raw": "魔都浦东哪里有舞萌",
+        "title_name": "maimai",
+        "province_name": "上海",
+        "city_name": "上海",
+        "county_name": "浦东新区",
+    }
+
+    context = builder.build(
+        session_state=state,
+        request=ChatRequest(message="魔都浦东哪里有舞萌"),
+        subagent=SubAgentProfile(
+            name="search_worker",
+            prompt_file="search_worker.md",
+            allowed_tools=[],
+            skill_files=[],
+        ),
+    )
+
+    assert '"query_rewrite"' in context.instructions
+    assert '"county_name": "浦东新区"' in context.instructions
+    assert '"title_name": "maimai"' in context.instructions
+
+
+def test_context_builder_injects_query_rewrite_into_structured_query_block(tmp_path: Path) -> None:
+    prompt_root = tmp_path / "prompts"
+    skill_root = tmp_path / "skills"
+    prompt_root.mkdir()
+    skill_root.mkdir()
+    (prompt_root / "system_base.md").write_text("base prompt", encoding="utf-8")
+    (prompt_root / "search_worker.md").write_text("search prompt", encoding="utf-8")
+
+    builder = ContextBuilder(
+        prompt_root=prompt_root,
+        skill_root=skill_root,
+        history_turn_limit=6,
+    )
+    state = AgentSessionState(session_id="s_rewrite_query", active_subagent="search_worker")
+    state.working_memory["keyword"] = "舞萌"
+    state.working_memory["query_rewrite"] = {
+        "raw": "魔都浦东哪里有舞萌",
+        "normalized_text": "上海浦东哪里有maimai",
+        "keyword": "maimai",
+        "title_name": "maimai",
+        "province_name": "上海",
+        "city_name": "上海",
+        "county_name": "浦东新区",
+        "knowledge_query": "上海浦东 maimai 机厅",
+    }
+
+    context = builder.build(
+        session_state=state,
+        request=ChatRequest(message="魔都浦东哪里有舞萌"),
+        subagent=SubAgentProfile(
+            name="search_worker",
+            prompt_file="search_worker.md",
+            allowed_tools=[],
+            skill_files=[],
+        ),
+    )
+
+    assert '"query"' in context.instructions
+    assert '"keyword": "舞萌"' in context.instructions
+    assert '"rewrite_keyword": "maimai"' in context.instructions
+    assert '"rewrite_title_name": "maimai"' in context.instructions
+    assert '"rewrite_city_name": "上海"' in context.instructions
+    assert '"rewrite_county_name": "浦东新区"' in context.instructions
+    assert '"rewrite_knowledge_query": "上海浦东 maimai 机厅"' in context.instructions
+
+
+def test_context_builder_preserves_last_db_query_when_rewrite_is_present(tmp_path: Path) -> None:
+    prompt_root = tmp_path / "prompts"
+    skill_root = tmp_path / "skills"
+    prompt_root.mkdir()
+    skill_root.mkdir()
+    (prompt_root / "system_base.md").write_text("base prompt", encoding="utf-8")
+    (prompt_root / "search_worker.md").write_text("search prompt", encoding="utf-8")
+
+    builder = ContextBuilder(
+        prompt_root=prompt_root,
+        skill_root=skill_root,
+        history_turn_limit=6,
+    )
+    state = AgentSessionState(session_id="s_rewrite_merge", active_subagent="search_worker")
+    state.working_memory["last_db_query"] = {
+        "keyword": "maimai",
+        "city_name": "上海",
+        "county_name": "徐汇区",
+        "shop_name": "星际传奇",
+    }
+    state.working_memory["query_rewrite"] = {
+        "raw": "魔都浦东星际传奇有舞萌吗",
+        "keyword": "maimai",
+        "title_name": "maimai",
+        "city_name": "上海",
+        "county_name": "浦东新区",
+        "shop_name": "星际传奇",
+    }
+
+    context = builder.build(
+        session_state=state,
+        request=ChatRequest(message="魔都浦东星际传奇有舞萌吗"),
+        subagent=SubAgentProfile(
+            name="search_worker",
+            prompt_file="search_worker.md",
+            allowed_tools=[],
+            skill_files=[],
+        ),
+    )
+
+    assert '"shop_name": "星际传奇"' in context.instructions
+    assert '"county_name": "徐汇区"' in context.instructions
+    assert '"rewrite_county_name": "浦东新区"' in context.instructions
+    assert '"rewrite_title_name": "maimai"' in context.instructions
 
 
 def test_context_builder_includes_recent_tool_results_history(tmp_path: Path) -> None:

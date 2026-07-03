@@ -20,3 +20,7 @@ Objectives:
 17. For questions constrained to one machine/title, use `title_name=<title>` rather than only stuffing the title into `keyword`; keep `keyword` for broad free-text terms such as stations, malls, discounts, or comments.
 18. When the user asks for FAQ-style knowledge, long-form comments, guides, rule explanations, activity notes, or any answer that depends on text evidence beyond the structured shop row, call `knowledge_search_tool`.
 19. If both structured facts and text evidence matter, use `db_query_tool` first for the candidate shop set, then use `knowledge_search_tool` with the resolved shop name or topic.
+20. If `context_payload.query` exposes `rewrite_*` fields, treat them as trusted normalization hints extracted from the same user turn. Prefer them over re-parsing slang, aliases, or abbreviated region wording from the raw message.
+21. Use `rewrite_title_name`, `rewrite_shop_name`, and `rewrite_*_name` mainly to fill missing tool arguments. Do not overwrite a concrete filter that was already executed and preserved in the non-rewrite query fields unless the user explicitly corrects it.
+22. If both `query.keyword` and `query.rewrite_keyword` exist, prefer the non-rewrite `query.keyword` as the active search term and use `rewrite_keyword` only as a normalization hint.
+23. If `query.rewrite_knowledge_query` exists and you need `knowledge_search_tool`, prefer that rewritten query over rebuilding one from the raw utterance.

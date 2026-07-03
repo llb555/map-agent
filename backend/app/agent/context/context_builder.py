@@ -92,6 +92,9 @@ class ContextBuilder:
                 "resolved_locations": self._compact_value(
                     self._memory_value(session_state.working_memory, "resolved_locations")
                 ),
+                "query_rewrite": self._compact_value(
+                    session_state.working_memory.get("query_rewrite")
+                ),
                 "last_mcp_result": self._compact_value(
                     session_state.working_memory.get("last_mcp_result")
                 ),
@@ -603,6 +606,7 @@ class ContextBuilder:
     ) -> QueryContextDto | None:
         memory = session_state.working_memory
         query_meta = memory.get("last_db_query")
+        rewrite_meta = memory.get("query_rewrite")
         request_page_size = request.page_size if request.page_size != 5 else None
         query = QueryContextDto(
             keyword=self._string_or_none(
@@ -658,6 +662,33 @@ class ContextBuilder:
             origin_lat=self._float_or_none(query_meta.get("origin_lat") if isinstance(query_meta, dict) else None),
             origin_coord_system=self._string_or_none(
                 query_meta.get("origin_coord_system") if isinstance(query_meta, dict) else None
+            ),
+            rewrite_raw=self._string_or_none(
+                rewrite_meta.get("raw") if isinstance(rewrite_meta, dict) else None
+            ),
+            rewrite_normalized_text=self._string_or_none(
+                rewrite_meta.get("normalized_text") if isinstance(rewrite_meta, dict) else None
+            ),
+            rewrite_keyword=self._string_or_none(
+                rewrite_meta.get("keyword") if isinstance(rewrite_meta, dict) else None
+            ),
+            rewrite_shop_name=self._string_or_none(
+                rewrite_meta.get("shop_name") if isinstance(rewrite_meta, dict) else None
+            ),
+            rewrite_title_name=self._string_or_none(
+                rewrite_meta.get("title_name") if isinstance(rewrite_meta, dict) else None
+            ),
+            rewrite_province_name=self._string_or_none(
+                rewrite_meta.get("province_name") if isinstance(rewrite_meta, dict) else None
+            ),
+            rewrite_city_name=self._string_or_none(
+                rewrite_meta.get("city_name") if isinstance(rewrite_meta, dict) else None
+            ),
+            rewrite_county_name=self._string_or_none(
+                rewrite_meta.get("county_name") if isinstance(rewrite_meta, dict) else None
+            ),
+            rewrite_knowledge_query=self._string_or_none(
+                rewrite_meta.get("knowledge_query") if isinstance(rewrite_meta, dict) else None
             ),
         )
         payload = self._compact_value(query.model_dump(mode="json", exclude_none=True))

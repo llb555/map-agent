@@ -6,6 +6,7 @@ import json
 import math
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,6 +15,7 @@ from typing import Any
 import hashlib
 import re
 from collections import Counter
+from collections import OrderedDict
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
 
@@ -411,6 +413,10 @@ class LangChainRAGService:
         # Initialize hybrid search
         self._hybrid_search_enabled = bool(settings.rag_hybrid_search_enabled)
         self._hybrid_alpha = max(0.0, min(1.0, float(settings.rag_hybrid_alpha)))
+        self._query_cache_enabled = bool(settings.rag_query_cache_enabled)
+        self._query_cache_max_entries = max(1, int(settings.rag_query_cache_max_entries))
+        self._query_cache_ttl_seconds = max(1.0, float(settings.rag_query_cache_ttl_seconds))
+        self._snapshot_path = settings.rag_snapshot_path
         self._bm25_index: BM25Index | None = BM25Index() if self._hybrid_search_enabled else None
 
         self._lock = Lock()
@@ -419,6 +425,10 @@ class LangChainRAGService:
         self._load_error: str | None = None
         self._faiss_index: Any | None = None
         self._supported_suffixes = {".md", ".txt", ".json", ".jsonl", ".pdf", ".docx", ".doc"}
+        self._query_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._query_cache_hits = 0
+        self._query_cache_misses = 0
+        self._rag_embedding_model_signature = settings.rag_embedding_model.strip()
 
     def health(self) -> dict[str, Any]:
         return {
@@ -435,6 +445,11 @@ class LangChainRAGService:
             "reranker_configured": self._reranker is not None and self._reranker.enabled,
             "hybrid_search_enabled": self._hybrid_search_enabled,
             "bm25_configured": self._bm25_index is not None,
+            "query_cache_enabled": self._query_cache_enabled,
+            "query_cache_size": len(self._query_cache),
+            "query_cache_hits": self._query_cache_hits,
+            "query_cache_misses": self._query_cache_misses,
+            "query_cache_hit_rate": self._query_cache_hit_rate(),
             "index_ready": self._index_ready,
             "chunk_count": len(self._chunk_records),
             "load_error": self._load_error,
@@ -563,6 +578,10 @@ class LangChainRAGService:
     def search(self, *, query: str, top_k: int | None = None) -> dict[str, Any]:
         normalized_query = query.strip()
         limit = max(1, min(int(top_k or self._top_k), 8))
+        cache_key = self._query_cache_key(query=normalized_query, top_k=limit)
+        cached = self._get_cached_search(cache_key)
+        if cached is not None:
+            return cached
         payload = {
             "backend": f"langchain_{self._vector_backend}",
             "query": {
@@ -656,6 +675,8 @@ class LangChainRAGService:
         payload["status"] = "completed"
         payload["hits"] = ranked
         payload["total_hits"] = len(ranked)
+        payload["cache_hit"] = False
+        self._set_cached_search(cache_key, payload)
         return payload
 
     def _ensure_index_loaded(self) -> None:
@@ -670,14 +691,25 @@ class LangChainRAGService:
                     self._bm25_index.build(doc_texts)
                 self._index_ready = True
                 self._load_error = None
+                self._clear_query_cache()
+                return
+            if self._try_restore_generic_snapshot():
+                if self._hybrid_search_enabled and self._bm25_index is not None and self._chunk_records:
+                    doc_texts = [record.text for record in self._chunk_records]
+                    self._bm25_index.build(doc_texts)
+                self._index_ready = True
+                self._load_error = None
+                self._clear_query_cache()
                 return
             documents = self._load_documents()
             chunks = self._split_documents(documents)
             if not chunks:
                 self._chunk_records = []
                 self._refresh_vector_backend([])
+                self._persist_generic_snapshot([])
                 self._index_ready = True
                 self._load_error = None
+                self._clear_query_cache()
                 return
 
             prepared_chunks = [item for item in chunks if str(item.page_content).strip()]
@@ -705,6 +737,7 @@ class LangChainRAGService:
                 )
             self._chunk_records = records
             self._refresh_vector_backend(records)
+            self._persist_generic_snapshot(records)
 
             # Build BM25 index if hybrid search is enabled
             if self._hybrid_search_enabled and self._bm25_index is not None and records:
@@ -713,6 +746,7 @@ class LangChainRAGService:
 
             self._index_ready = True
             self._load_error = None
+            self._clear_query_cache()
 
     def _refresh_vector_backend(self, records: list[_ChunkRecord]) -> None:
         if self._vector_backend != "faiss":
@@ -794,6 +828,12 @@ class LangChainRAGService:
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 1,
+            "embedding_model_signature": self._rag_embedding_model_signature,
+            "chunk_config": {
+                "chunk_size": self._chunk_size,
+                "chunk_overlap": self._chunk_overlap,
+                "semantic_chunking_enabled": self._semantic_chunking_enabled,
+            },
             "source_signature": self._source_signature(),
             "records": [
                 {
@@ -819,7 +859,17 @@ class LangChainRAGService:
             return False
         if not isinstance(payload, dict):
             return False
+        if payload.get("version") != 1:
+            return False
         if payload.get("source_signature") != self._source_signature():
+            return False
+        if payload.get("embedding_model_signature") != self._rag_embedding_model_signature:
+            return False
+        if payload.get("chunk_config") != {
+            "chunk_size": self._chunk_size,
+            "chunk_overlap": self._chunk_overlap,
+            "semantic_chunking_enabled": self._semantic_chunking_enabled,
+        }:
             return False
         raw_records = payload.get("records")
         if not isinstance(raw_records, list):
@@ -862,6 +912,143 @@ class LangChainRAGService:
                     path.unlink()
             except OSError:
                 continue
+
+    def _persist_generic_snapshot(self, records: list[_ChunkRecord]) -> None:
+        path = self._snapshot_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "embedding_model_signature": self._rag_embedding_model_signature,
+            "chunk_config": {
+                "chunk_size": self._chunk_size,
+                "chunk_overlap": self._chunk_overlap,
+                "semantic_chunking_enabled": self._semantic_chunking_enabled,
+            },
+            "source_signature": self._source_signature(),
+            "records": [
+                {
+                    "chunk_id": row.chunk_id,
+                    "title": row.title,
+                    "source_uri": row.source_uri,
+                    "source_type": row.source_type,
+                    "text": row.text,
+                    "embedding": row.embedding,
+                    "metadata": row.metadata,
+                }
+                for row in records
+            ],
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _try_restore_generic_snapshot(self) -> bool:
+        if not self._snapshot_path.exists():
+            return False
+        try:
+            payload = json.loads(self._snapshot_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("version") != 1:
+            return False
+        if payload.get("source_signature") != self._source_signature():
+            return False
+        if payload.get("embedding_model_signature") != self._rag_embedding_model_signature:
+            return False
+        if payload.get("chunk_config") != {
+            "chunk_size": self._chunk_size,
+            "chunk_overlap": self._chunk_overlap,
+            "semantic_chunking_enabled": self._semantic_chunking_enabled,
+        }:
+            return False
+        raw_records = payload.get("records")
+        if not isinstance(raw_records, list):
+            return False
+        records: list[_ChunkRecord] = []
+        for item in raw_records:
+            if not isinstance(item, dict):
+                continue
+            embedding = item.get("embedding")
+            metadata = item.get("metadata")
+            text = item.get("text")
+            if not isinstance(embedding, list) or not isinstance(metadata, dict) or not isinstance(text, str):
+                continue
+            records.append(
+                _ChunkRecord(
+                    chunk_id=str(item.get("chunk_id") or f"chunk_{len(records) + 1}"),
+                    title=str(item.get("title") or "unknown"),
+                    source_uri=str(item.get("source_uri") or "knowledge://unknown"),
+                    source_type=str(item.get("source_type") or "document"),
+                    text=text,
+                    embedding=[float(value) for value in embedding],
+                    metadata=metadata,
+                )
+            )
+        if not records:
+            return False
+        self._chunk_records = records
+        return True
+
+    def _query_cache_key(self, *, query: str, top_k: int) -> str:
+        config_signature = {
+            "source_signature": self._source_signature(),
+            "top_k": top_k,
+            "vector_backend": self._vector_backend,
+            "hybrid": self._hybrid_search_enabled,
+            "hybrid_alpha": self._hybrid_alpha,
+            "reranker": self._reranker_enabled,
+        }
+        return json.dumps(
+            {
+                "query": query,
+                "config": config_signature,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _get_cached_search(self, cache_key: str) -> dict[str, Any] | None:
+        if not self._query_cache_enabled or not cache_key:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            entry = self._query_cache.get(cache_key)
+            if entry is None:
+                self._query_cache_misses += 1
+                return None
+            cached_at, payload = entry
+            if now - cached_at > self._query_cache_ttl_seconds:
+                self._query_cache.pop(cache_key, None)
+                self._query_cache_misses += 1
+                return None
+            self._query_cache.move_to_end(cache_key)
+            self._query_cache_hits += 1
+            cached = json.loads(json.dumps(payload, ensure_ascii=False))
+            cached["cache_hit"] = True
+            return cached
+
+    def _set_cached_search(self, cache_key: str, payload: dict[str, Any]) -> None:
+        if not self._query_cache_enabled or not cache_key:
+            return
+        cached = json.loads(json.dumps(payload, ensure_ascii=False))
+        cached["cache_hit"] = False
+        with self._lock:
+            self._query_cache[cache_key] = (time.monotonic(), cached)
+            self._query_cache.move_to_end(cache_key)
+            while len(self._query_cache) > self._query_cache_max_entries:
+                self._query_cache.popitem(last=False)
+
+    def _clear_query_cache(self) -> None:
+        with self._lock:
+            self._query_cache.clear()
+            self._query_cache_hits = 0
+            self._query_cache_misses = 0
+
+    def _query_cache_hit_rate(self) -> float:
+        total = self._query_cache_hits + self._query_cache_misses
+        if total <= 0:
+            return 0.0
+        return round(self._query_cache_hits / total, 4)
 
     def _import_faiss(self) -> Any:
         try:

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.agent.tools.builtin.provider import BuiltinToolContext
+from app.agent.tools.builtin.query_rewrite import load_or_rewrite
 
 
 def prepare_arguments(raw_arguments: dict[str, Any], runtime_context: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -18,7 +19,8 @@ def prepare_arguments(raw_arguments: dict[str, Any], runtime_context: dict[str, 
     if isinstance(request, dict):
         message = request.get("message")
         if isinstance(message, str) and message.strip():
-            args["query"] = message.strip()
+            rewritten = load_or_rewrite(runtime_context, fallback_message=message)
+            args["query"] = rewritten.knowledge_query or message.strip()
             hydrated.append("query")
             return args, hydrated
 

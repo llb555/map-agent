@@ -121,6 +121,10 @@ class Settings:
     rag_reranker_timeout_seconds: float = 20.0
     rag_hybrid_search_enabled: bool = False
     rag_hybrid_alpha: float = 0.5
+    rag_query_cache_enabled: bool = True
+    rag_query_cache_max_entries: int = 128
+    rag_query_cache_ttl_seconds: float = 120.0
+    rag_snapshot_path: Path = Path("data/runtime/rag_snapshot.json")
     agent_max_steps: int = 20
     agent_context_window: int = 24
     agent_nodes_definitions_dir: Path = Path("app/agent/nodes/definitions")
@@ -137,6 +141,8 @@ class Settings:
     arcade_geo_sync_limit: int = 8
     arcade_geo_max_workers: int = 4
     arcade_geo_request_timeout_seconds: float = 1.2
+    arcade_geo_flush_interval_seconds: float = 0.5
+    chat_session_flush_interval_seconds: float = 0.5
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -238,6 +244,16 @@ class Settings:
             ),
             rag_hybrid_search_enabled=_env_bool("RAG_HYBRID_SEARCH_ENABLED", cls.rag_hybrid_search_enabled),
             rag_hybrid_alpha=float(os.getenv("RAG_HYBRID_ALPHA", str(cls.rag_hybrid_alpha))),
+            rag_query_cache_enabled=_env_bool("RAG_QUERY_CACHE_ENABLED", cls.rag_query_cache_enabled),
+            rag_query_cache_max_entries=int(
+                os.getenv("RAG_QUERY_CACHE_MAX_ENTRIES", str(cls.rag_query_cache_max_entries))
+            ),
+            rag_query_cache_ttl_seconds=float(
+                os.getenv("RAG_QUERY_CACHE_TTL_SECONDS", str(cls.rag_query_cache_ttl_seconds))
+            ),
+            rag_snapshot_path=_resolve_project_path(
+                os.getenv("RAG_SNAPSHOT_PATH", str(cls.rag_snapshot_path))
+            ),
             agent_max_steps=int(
                 os.getenv("AGENT_MAX_STEPS", str(cls.agent_max_steps))
             ),
@@ -291,6 +307,18 @@ class Settings:
                 os.getenv(
                     "ARCADE_GEO_REQUEST_TIMEOUT_SECONDS",
                     str(cls.arcade_geo_request_timeout_seconds),
+                )
+            ),
+            arcade_geo_flush_interval_seconds=float(
+                os.getenv(
+                    "ARCADE_GEO_FLUSH_INTERVAL_SECONDS",
+                    str(cls.arcade_geo_flush_interval_seconds),
+                )
+            ),
+            chat_session_flush_interval_seconds=float(
+                os.getenv(
+                    "CHAT_SESSION_FLUSH_INTERVAL_SECONDS",
+                    str(cls.chat_session_flush_interval_seconds),
                 )
             ),
         )

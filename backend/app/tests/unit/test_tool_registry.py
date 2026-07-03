@@ -184,6 +184,26 @@ def test_tool_registry_can_resolve_named_place_without_mcp_geocode(tmp_path: Pat
     assert result.output["locations"][0]["lng"] == 108.960987
 
 
+def test_tool_registry_prepares_location_resolve_args_from_query_rewrite(tmp_path: Path) -> None:
+    registry = _build_registry(tmp_path)
+
+    args, hydrated = registry._providers[0].prepare_arguments(
+        tool_name="location_resolve_tool",
+        raw_arguments={},
+        runtime_context={
+            "last_request": {
+                "message": "魔都浦东人广附近有舞萌吗",
+            }
+        },
+    )
+
+    assert args["query"] == "人民广场"
+    assert args["province_name"] == "上海"
+    assert args["city_name"] == "上海"
+    assert args["county_name"] == "浦东新区"
+    assert "query" in hydrated
+
+
 def test_tool_registry_normalizes_city_name_in_city_code_field(tmp_path: Path) -> None:
     registry = _build_registry(tmp_path)
     result = _run(registry.execute(

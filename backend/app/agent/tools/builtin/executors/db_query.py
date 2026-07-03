@@ -7,6 +7,7 @@ from typing import Any
 
 from app.agent.tools.builtin.executor_utils import as_region_code_or_name, short_text
 from app.agent.tools.builtin.provider import BuiltinToolContext
+from app.agent.tools.builtin.query_rewrite import load_or_rewrite
 from app.infra.observability.logger import get_logger
 
 logger = get_logger(__name__)
@@ -85,6 +86,29 @@ def _resolved_location_origin(memory: dict[str, Any]) -> dict[str, Any] | None:
 def prepare_arguments(raw_arguments: dict[str, Any], runtime_context: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     args = dict(raw_arguments)
     hydrated: list[str] = []
+    request = runtime_context.get("last_request")
+    message = request.get("message") if isinstance(request, dict) else None
+    if isinstance(message, str) and message.strip():
+        rewritten = load_or_rewrite(runtime_context, fallback_message=message)
+        if rewritten.shop_name and not (isinstance(args.get("shop_name"), str) and args.get("shop_name").strip()):
+            args["shop_name"] = rewritten.shop_name
+            hydrated.append("shop_name")
+        if rewritten.title_name and not (isinstance(args.get("title_name"), str) and args.get("title_name").strip()):
+            args["title_name"] = rewritten.title_name
+            hydrated.append("title_name")
+        if rewritten.province_name and not args.get("province_name"):
+            args["province_name"] = rewritten.province_name
+            hydrated.append("province_name")
+        if rewritten.city_name and not args.get("city_name"):
+            args["city_name"] = rewritten.city_name
+            hydrated.append("city_name")
+        if rewritten.county_name and not args.get("county_name"):
+            args["county_name"] = rewritten.county_name
+            hydrated.append("county_name")
+        if rewritten.keyword and not (isinstance(args.get("keyword"), str) and args.get("keyword").strip()):
+            args["keyword"] = rewritten.keyword
+            hydrated.append("keyword")
+
     location = _memory_artifact(runtime_context, "client_location")
     resolved_origin = _resolved_location_origin(runtime_context)
     has_client_location = isinstance(location, dict)
@@ -116,6 +140,7 @@ def prepare_arguments(raw_arguments: dict[str, Any], runtime_context: dict[str, 
     if args.get("origin_coord_system") is None:
         args["origin_coord_system"] = origin_coord_system or "gcj02"
         hydrated.append("origin_coord_system")
+
     return args, hydrated
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -103,10 +104,12 @@ def append_worker_run(memory: dict[str, Any] | None, run: dict[str, Any], *, max
 class SessionStateStore:
     """Thread-safe session store keyed by session_id with optional disk persistence."""
 
-    def __init__(self, *, storage_path: Path | None = None) -> None:
+    def __init__(self, *, storage_path: Path | None = None, flush_interval_seconds: float = 0.5) -> None:
         self._lock = Lock()
         self._states: dict[str, AgentSessionState] = {}
         self._storage_path = storage_path
+        self._flush_interval_seconds = max(0.0, float(flush_interval_seconds))
+        self._last_flush_at = 0.0
         self._load_from_disk()
 
     def get_or_create(self, session_id: str) -> AgentSessionState:
@@ -149,14 +152,29 @@ class SessionStateStore:
                 self._flush_to_disk_locked()
             return existed
 
-    def save(self, state: AgentSessionState) -> None:
+    def save(self, state: AgentSessionState, *, force_flush: bool = False) -> None:
         """Persist one mutated session state and flush the snapshot file."""
         with self._lock:
             self._states[state.session_id] = deepcopy(state)
+            if force_flush or self._should_flush_locked(state):
+                self._flush_to_disk_locked()
+                self._last_flush_at = time.monotonic()
+
+    def flush(self) -> None:
+        with self._lock:
             self._flush_to_disk_locked()
+            self._last_flush_at = time.monotonic()
 
     def _load_from_disk(self) -> None:
-        if self._storage_path is None or not self._storage_path.exists():
+        if self._storage_path is None:
+            return
+        if self._storage_path.is_dir():
+            self._load_from_session_directory(self._storage_path)
+            return
+        if not self._storage_path.exists():
+            session_dir = self._session_directory_path()
+            if session_dir.exists():
+                self._load_from_session_directory(session_dir)
             return
         try:
             payload = json.loads(self._storage_path.read_text(encoding="utf-8"))
@@ -176,20 +194,63 @@ class SessionStateStore:
                 restored[state.session_id] = state
         self._states = restored
 
+    def _load_from_session_directory(self, directory: Path) -> None:
+        restored: dict[str, AgentSessionState] = {}
+        for path in sorted(directory.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            state = _state_from_dict(payload)
+            if state is not None:
+                restored[state.session_id] = state
+        self._states = restored
+
     def _flush_to_disk_locked(self) -> None:
         if self._storage_path is None: #if no storage path, skip disk flush
             return
-        # Sort sessions by updated_at desc for better readability, though not required for loading.
-        snapshots = sorted(self._states.values(), key=lambda item: item.updated_at, reverse=True)
-        # save the whole session list as one JSON object to simplify loading and future schema evolution, even if it may rewrite unchanged sessions
-        payload = {
-            "version": 1,
-            "sessions": [_state_to_dict(item) for item in snapshots],
-        }
-        self._storage_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self._storage_path.with_name(f"{self._storage_path.name}.tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp_path.replace(self._storage_path)
+        session_dir = self._session_directory_path()
+        session_dir.mkdir(parents=True, exist_ok=True)
+        existing_files = {path.stem for path in session_dir.glob("*.json")}
+        active_ids = set(self._states.keys())
+
+        for state in self._states.values():
+            target_path = session_dir / f"{state.session_id}.json"
+            temp_path = target_path.with_name(f"{target_path.name}.tmp")
+            temp_path.write_text(
+                json.dumps(_state_to_dict(state), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temp_path.replace(target_path)
+
+        for stale_id in existing_files - active_ids:
+            stale_path = session_dir / f"{stale_id}.json"
+            try:
+                stale_path.unlink()
+            except OSError:
+                continue
+
+        if self._storage_path.exists() and self._storage_path.is_file():
+            try:
+                self._storage_path.unlink()
+            except OSError:
+                pass
+
+    def _should_flush_locked(self, state: AgentSessionState) -> bool:
+        if self._storage_path is None:
+            return False
+        if state.status in {"completed", "failed"}:
+            return True
+        if self._last_flush_at <= 0:
+            return False
+        return (time.monotonic() - self._last_flush_at) >= self._flush_interval_seconds
+
+    def _session_directory_path(self) -> Path:
+        if self._storage_path is None:
+            raise RuntimeError("session_storage_unavailable")
+        if self._storage_path.suffix:
+            return self._storage_path.with_suffix("")
+        return self._storage_path
 
 
 def _state_to_dict(state: AgentSessionState) -> dict[str, Any]:

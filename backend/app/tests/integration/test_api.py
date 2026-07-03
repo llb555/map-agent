@@ -733,6 +733,7 @@ def test_chat_sessions_survive_app_restart(tmp_path: Path) -> None:
     first_resp = client.post("/api/chat", json={"message": "find Gamma", "page_size": 3})
     assert first_resp.status_code == 200
     session_id = first_resp.json()["session_id"]
+    assert (session_store_path.with_suffix("") / f"{session_id}.json").exists()
 
     restarted_client = _build_client(tmp_path, session_store_path=session_store_path)
 

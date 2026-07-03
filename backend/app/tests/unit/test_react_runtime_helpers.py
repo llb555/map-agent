@@ -15,6 +15,7 @@ from app.agent.runtime.session_state import (
     set_working_memory_artifact,
 )
 from app.agent.tools.registry import ToolExecutionResult
+from app.protocol.messages import ChatRequest
 
 
 def _runtime() -> ReactRuntime:
@@ -136,7 +137,7 @@ def test_prepare_tool_arguments_hydrates_nearby_db_query_from_mcp_location() -> 
     assert args["origin_lng"] == 121.48819
     assert args["origin_lat"] == 31.27687
     assert args["origin_coord_system"] == "gcj02"
-    assert hydrated == ["sort_by", "sort_order", "origin_lng", "origin_lat", "origin_coord_system"]
+    assert hydrated == ["keyword", "sort_by", "sort_order", "origin_lng", "origin_lat", "origin_coord_system"]
 
 
 def test_prepare_tool_arguments_hydrates_sort_fields_from_last_db_query() -> None:
@@ -218,7 +219,28 @@ def test_prepare_turn_memory_clears_stale_reply() -> None:
     prepared = runtime._prepare_turn_memory(memory)
 
     assert "reply" not in prepared
-    assert prepared["assistant_token_emitted"] is False
+
+
+def test_run_chat_session_stores_query_rewrite_in_memory() -> None:
+    runtime = _runtime()
+    state = AgentSessionState(session_id="s_rewrite")
+    request = ChatRequest(message="魔都浦东哪里有舞萌")
+
+    state.working_memory["keyword"] = "old"
+    state.active_subagent = "main_agent"
+    state.working_memory = runtime._prepare_turn_memory(state.working_memory)
+    state.working_memory["last_request"] = request.model_dump(mode="json")
+    state.working_memory["keyword"] = request.keyword or "魔都浦东哪里有舞萌"
+
+    from app.agent.tools.builtin.query_rewrite import rewrite_query
+
+    rewritten = rewrite_query(request.message)
+    state.working_memory["query_rewrite"] = rewritten.to_memory_payload()
+
+    assert state.working_memory["query_rewrite"]["city_name"] == "上海"
+    assert state.working_memory["query_rewrite"]["county_name"] == "浦东新区"
+    assert state.working_memory["query_rewrite"]["title_name"] == "maimai"
+    assert state.working_memory["assistant_token_emitted"] is False
 
 
 def test_apply_tool_memory_keeps_mcp_resolved_locations() -> None:

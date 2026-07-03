@@ -28,6 +28,7 @@ class ArcadeGeoResolverConfig:
     sync_limit: int = 8
     max_workers: int = 4
     request_interval_seconds: float = 0.0
+    flush_interval_seconds: float = 0.5
 
 
 class ArcadeGeoResolver:
@@ -38,6 +39,8 @@ class ArcadeGeoResolver:
         self._lock = Lock()
         self._request_lock = Lock()
         self._last_request_at = 0.0
+        self._last_flush_at = 0.0
+        self._dirty = False
         self._cache = self._load_cache()
 
     def resolve_one(self, raw: Mapping[str, Any]) -> ArcadeGeoDto | None:
@@ -112,6 +115,7 @@ class ArcadeGeoResolver:
                 source_id = self._source_id(row)
                 if source_id is not None:
                     resolved[source_id] = geo
+        self.flush()
         return resolved
 
     def _geo_from_catalog(self, raw: Mapping[str, Any]) -> ArcadeGeoDto | None:
@@ -249,7 +253,14 @@ class ArcadeGeoResolver:
             for stale_key in stale_keys:
                 self._cache.pop(stale_key, None)
             self._cache[key] = entry
-            self._flush_cache_locked()
+            self._dirty = True
+            if self._should_flush_locked():
+                self._flush_cache_locked()
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._dirty:
+                self._flush_cache_locked()
 
     def _load_cache(self) -> dict[str, dict[str, Any]]:
         path = self._config.cache_path
@@ -278,6 +289,16 @@ class ArcadeGeoResolver:
         temp = path.with_name(f"{path.name}.tmp")
         temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(path)
+        self._last_flush_at = time.monotonic()
+        self._dirty = False
+
+    def _should_flush_locked(self) -> bool:
+        interval = max(0.0, float(self._config.flush_interval_seconds or 0.0))
+        if interval <= 0:
+            return True
+        if self._last_flush_at <= 0:
+            return False
+        return (time.monotonic() - self._last_flush_at) >= interval
 
     def _cache_key(self, raw: Mapping[str, Any]) -> str | None:
         source_id = self._source_id(raw)

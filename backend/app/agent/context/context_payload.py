@@ -50,6 +50,15 @@ class QueryContextDto(BaseModel):
     origin_lng: float | None = None
     origin_lat: float | None = None
     origin_coord_system: str | None = None
+    rewrite_raw: str | None = None
+    rewrite_normalized_text: str | None = None
+    rewrite_keyword: str | None = None
+    rewrite_shop_name: str | None = None
+    rewrite_title_name: str | None = None
+    rewrite_province_name: str | None = None
+    rewrite_city_name: str | None = None
+    rewrite_county_name: str | None = None
+    rewrite_knowledge_query: str | None = None
 
 
 class SearchCatalogShopDto(BaseModel):

@@ -74,6 +74,7 @@ def build_container(settings: Settings) -> AppContainer:
             request_timeout_seconds=settings.arcade_geo_request_timeout_seconds,
             sync_limit=settings.arcade_geo_sync_limit,
             max_workers=settings.arcade_geo_max_workers,
+            flush_interval_seconds=settings.arcade_geo_flush_interval_seconds,
         )
     )
     arcade_payload_mapper = ArcadePayloadMapper(geo_resolver=arcade_geo_resolver)
@@ -122,7 +123,10 @@ def build_container(settings: Settings) -> AppContainer:
         permission_checker=permission_checker,
         strict_schema=True,
     )
-    session_store = SessionStateStore(storage_path=settings.chat_session_store_path)
+    session_store = SessionStateStore(
+        storage_path=settings.chat_session_store_path,
+        flush_interval_seconds=settings.chat_session_flush_interval_seconds,
+    )
     react_runtime = ReactRuntime(
         context_builder=context_builder,
         subagent_builder=subagent_builder,
