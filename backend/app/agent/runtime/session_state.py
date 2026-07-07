@@ -5,16 +5,18 @@ from __future__ import annotations
 import json
 import logging
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 TurnRole = Literal["user", "assistant", "tool"]
 TurnScope = Literal["conversation", "worker"]
 SessionStatus = Literal["idle", "running", "completed", "failed"]
+RunStatus = Literal["idle", "running", "completed", "failed"]
 logger = logging.getLogger(__name__)
 
 
@@ -24,6 +26,24 @@ class SessionOwnershipError(RuntimeError):
     def __init__(self, session_id: str) -> None:
         super().__init__(f"session '{session_id}' is not available for this client")
         self.session_id = session_id
+
+
+class SessionRunConflictError(RuntimeError):
+    """Raised when a new run conflicts with a persisted in-flight run."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"session '{session_id}' is already running")
+        self.session_id = session_id
+
+
+@dataclass(frozen=True)
+class SessionRunReservation:
+    """Result of reserving a session run."""
+
+    session_id: str
+    started: bool
+    idempotency_key: str | None
+    last_stream_offset: int
 
 
 def _utc_now_iso() -> str:
@@ -56,6 +76,10 @@ class AgentSessionState:
     active_subagent: str = "main_agent"
     intent: str = "search"
     status: SessionStatus = "idle"
+    run_status: RunStatus = "idle"
+    idempotency_key: str | None = None
+    current_run_id: str | None = None
+    last_stream_offset: int = 0
     last_error: str | None = None
     turns: list[AgentTurn] = field(default_factory=list)
     working_memory: dict[str, Any] = field(default_factory=dict)
@@ -123,6 +147,8 @@ class SessionStateStore:
     def snapshot(self, session_id: str, *, client_id: str | None = None) -> AgentSessionState | None:
         """Return deep-copied session state for API serialization."""
         with self._lock:
+            with self._file_lock():
+                self._load_from_disk_locked()
             state = self._states.get(session_id)
             if state is None:
                 return None
@@ -134,6 +160,8 @@ class SessionStateStore:
         """Return recent session snapshots sorted by updated_at desc."""
         safe_limit = max(1, min(limit, 200))
         with self._lock:
+            with self._file_lock():
+                self._load_from_disk_locked()
             snapshots = [
                 deepcopy(item)
                 for item in self._states.values()
@@ -145,27 +173,145 @@ class SessionStateStore:
     def delete(self, session_id: str, *, client_id: str | None = None) -> bool:
         """Delete one session by id; return True when it existed."""
         with self._lock:
-            state = self._states.get(session_id)
-            existed = state is not None and _client_can_access(state, client_id)
-            if existed:
-                del self._states[session_id]
-                self._flush_to_disk_locked()
-            return existed
+            with self._file_lock():
+                self._load_from_disk_locked()
+                state = self._states.get(session_id)
+                existed = state is not None and _client_can_access(state, client_id)
+                if existed:
+                    del self._states[session_id]
+                    self._flush_to_disk_locked()
+                return existed
+
+    def reserve_run(
+        self,
+        session_id: str,
+        *,
+        client_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> SessionRunReservation:
+        """Atomically reserve a new run, or return the existing idempotent run."""
+        with self._lock:
+            with self._file_lock():
+                self._load_from_disk_locked()
+                return self._reserve_run_locked(
+                    session_id,
+                    client_id=client_id,
+                    idempotency_key=idempotency_key,
+                )
+
+    def _reserve_run_locked(
+        self,
+        session_id: str,
+        *,
+        client_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> SessionRunReservation:
+        state = self._states.get(session_id)
+        if state is None:
+            state = AgentSessionState(session_id=session_id)
+            self._states[session_id] = state
+        if not _client_can_access(state, client_id):
+            raise SessionOwnershipError(session_id)
+
+        incoming_key = _normalize_idempotency_key(idempotency_key)
+        existing_key = _normalize_idempotency_key(state.idempotency_key)
+        is_same_run = bool(incoming_key and existing_key and incoming_key == existing_key)
+        if state.run_status == "running" or state.status == "running":
+            if is_same_run:
+                return SessionRunReservation(
+                    session_id=session_id,
+                    started=False,
+                    idempotency_key=existing_key,
+                    last_stream_offset=state.last_stream_offset,
+                )
+            raise SessionRunConflictError(session_id)
+        if is_same_run and state.run_status in {"completed", "failed"}:
+            return SessionRunReservation(
+                session_id=session_id,
+                started=False,
+                idempotency_key=existing_key,
+                last_stream_offset=state.last_stream_offset,
+            )
+
+        state.client_id = state.client_id or client_id
+        state.status = "running"
+        state.run_status = "running"
+        state.idempotency_key = incoming_key
+        state.current_run_id = incoming_key
+        state.last_error = None
+        state.updated_at = _utc_now_iso()
+        state.working_memory = ensure_working_memory_shape(state.working_memory)
+        self._states[session_id] = deepcopy(state)
+        self._flush_to_disk_locked()
+        self._last_flush_at = time.monotonic()
+        return SessionRunReservation(
+            session_id=session_id,
+            started=True,
+            idempotency_key=incoming_key,
+            last_stream_offset=state.last_stream_offset,
+        )
+
+    def finish_run(self, session_id: str, *, status: RunStatus) -> None:
+        """Persist terminal run state after a background task exits."""
+        if status not in {"completed", "failed"}:
+            return
+        with self._lock:
+            with self._file_lock():
+                self._load_from_disk_locked()
+                self._finish_run_locked(session_id, status=status)
+
+    def _finish_run_locked(self, session_id: str, *, status: RunStatus) -> None:
+        state = self._states.get(session_id)
+        if state is None:
+            return
+        state.run_status = status
+        state.updated_at = _utc_now_iso()
+        self._states[session_id] = deepcopy(state)
+        self._flush_to_disk_locked()
+        self._last_flush_at = time.monotonic()
+
+    def record_stream_offset(self, session_id: str, offset: int) -> None:
+        """Persist the latest SSE offset observed for a session."""
+        with self._lock:
+            with self._file_lock():
+                self._load_from_disk_locked()
+                self._record_stream_offset_locked(session_id, offset)
+
+    def _record_stream_offset_locked(self, session_id: str, offset: int) -> None:
+        state = self._states.get(session_id)
+        if state is None:
+            return
+        if offset <= state.last_stream_offset:
+            return
+        state.last_stream_offset = offset
+        state.updated_at = _utc_now_iso()
+        self._states[session_id] = deepcopy(state)
+        self._flush_to_disk_locked()
+        self._last_flush_at = time.monotonic()
 
     def save(self, state: AgentSessionState, *, force_flush: bool = False) -> None:
         """Persist one mutated session state and flush the snapshot file."""
         with self._lock:
-            self._states[state.session_id] = deepcopy(state)
-            if force_flush or self._should_flush_locked(state):
-                self._flush_to_disk_locked()
-                self._last_flush_at = time.monotonic()
+            with self._file_lock():
+                self._load_from_disk_locked()
+                self._save_locked(state, force_flush=force_flush)
+
+    def _save_locked(self, state: AgentSessionState, *, force_flush: bool = False) -> None:
+        self._states[state.session_id] = deepcopy(state)
+        self._flush_to_disk_locked()
+        self._last_flush_at = time.monotonic()
 
     def flush(self) -> None:
         with self._lock:
-            self._flush_to_disk_locked()
-            self._last_flush_at = time.monotonic()
+            with self._file_lock():
+                self._flush_to_disk_locked()
+                self._last_flush_at = time.monotonic()
 
     def _load_from_disk(self) -> None:
+        with self._file_lock():
+            self._load_from_disk_locked()
+
+    def _load_from_disk_locked(self) -> None:
         if self._storage_path is None:
             return
         if self._storage_path.is_dir():
@@ -252,6 +398,28 @@ class SessionStateStore:
             return self._storage_path.with_suffix("")
         return self._storage_path
 
+    @contextmanager
+    def _file_lock(self) -> Iterator[None]:
+        if self._storage_path is None:
+            yield
+            return
+        lock_path = self._storage_path.with_name(f"{self._storage_path.name}.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            try:
+                import fcntl
+            except ImportError:  # pragma: no cover - Windows fallback
+                yield
+                return
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+
 
 def _state_to_dict(state: AgentSessionState) -> dict[str, Any]:
     return {
@@ -261,6 +429,10 @@ def _state_to_dict(state: AgentSessionState) -> dict[str, Any]:
         "active_subagent": state.active_subagent,
         "intent": state.intent,
         "status": state.status,
+        "run_status": state.run_status,
+        "idempotency_key": state.idempotency_key,
+        "current_run_id": state.current_run_id,
+        "last_stream_offset": state.last_stream_offset,
         "last_error": state.last_error,
         "turns": [
             {
@@ -304,6 +476,10 @@ def _state_from_dict(raw: object) -> AgentSessionState | None:
         active_subagent=_coerce_active_agent(raw.get("active_subagent"), default="main_agent"),
         intent=_coerce_str(raw.get("intent"), default="search"),
         status=_coerce_status(raw.get("status"), default="completed" if turns else "idle"),
+        run_status=_coerce_run_status(raw.get("run_status"), default=_coerce_run_status(raw.get("status"), default="idle")),
+        idempotency_key=_normalize_idempotency_key(raw.get("idempotency_key")),
+        current_run_id=_normalize_idempotency_key(raw.get("current_run_id")),
+        last_stream_offset=_coerce_int(raw.get("last_stream_offset"), default=0),
         last_error=raw.get("last_error") if isinstance(raw.get("last_error"), str) else None,
         turns=turns,
         working_memory=working_memory,
@@ -359,6 +535,21 @@ def _coerce_status(raw: object, *, default: SessionStatus) -> SessionStatus:
     if raw in {"idle", "running", "completed", "failed"}:
         return raw
     return default
+
+
+def _coerce_run_status(raw: object, *, default: RunStatus) -> RunStatus:
+    if raw in {"idle", "running", "completed", "failed"}:
+        return raw
+    return default
+
+
+def _normalize_idempotency_key(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip()
+    if not normalized:
+        return None
+    return normalized[:128]
 
 
 def _coerce_active_agent(raw: object, *, default: str) -> str:

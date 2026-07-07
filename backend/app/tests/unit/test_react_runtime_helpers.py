@@ -39,6 +39,7 @@ class _FakeToolRegistry:
         tool_name: str,
         raw_arguments: dict[str, object],
         allowed_tools: list[str],
+        runtime_context: dict[str, object] | None = None,
     ) -> ToolExecutionResult:
         assert tool_name == "knowledge_search_tool"
         return ToolExecutionResult(

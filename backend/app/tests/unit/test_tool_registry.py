@@ -8,10 +8,11 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from app.agent.tools.base import ProviderExecutionResult, ToolDescriptor
 from app.agent.tools.builtin import BuiltinToolProvider
 from app.agent.tools.mcp_gateway import MCPServerConfig, MCPToolGateway
 from app.agent.tools.permission import ToolPermissionChecker
-from app.agent.tools.registry import ToolRegistry
+from app.agent.tools.registry import ToolRegistry, ToolRuntimePolicy
 from app.core.config import Settings
 from app.infra.db.local_store import LocalArcadeStore
 
@@ -107,6 +108,52 @@ def _build_mcp_gateway() -> MCPToolGateway:
     return gateway
 
 
+class _GovernedProvider:
+    provider_name = "governed"
+
+    def __init__(self, *, fail_once: bool = False, delay_seconds: float = 0.0) -> None:
+        self.calls = 0
+        self.fail_once = fail_once
+        self.delay_seconds = delay_seconds
+
+    async def get_tools(self) -> dict[str, ToolDescriptor]:
+        return {
+            "governed_tool": ToolDescriptor(
+                name="governed_tool",
+                description="Governance test tool",
+                provider=self.provider_name,
+                input_schema={"type": "object", "additionalProperties": True},
+            )
+        }
+
+    async def execute(self, *, tool_name: str, raw_arguments: dict, validated_arguments=None):
+        self.calls += 1
+        if self.delay_seconds:
+            await asyncio.sleep(self.delay_seconds)
+        if self.fail_once and self.calls == 1:
+            raise RuntimeError("temporary failure")
+        return ProviderExecutionResult(
+            status="completed",
+            output={"ok": True, "fallback_reason": raw_arguments.get("fallback_reason")},
+        )
+
+    async def refresh(self) -> None:
+        return None
+
+    def health(self) -> dict[str, object]:
+        return {"calls": self.calls}
+
+
+def _build_governed_registry(provider: _GovernedProvider, policy: ToolRuntimePolicy) -> ToolRegistry:
+    return ToolRegistry(
+        providers=[provider],
+        permission_checker=ToolPermissionChecker(policy_file=Path("missing.yaml")),
+        strict_schema=True,
+        tool_policies={"governed_tool": policy},
+        budget_limits={"governed": 1},
+    )
+
+
 def test_tool_registry_returns_validation_error_for_bad_args(tmp_path: Path) -> None:
     registry = _build_registry(tmp_path)
     result = _run(registry.execute(
@@ -122,6 +169,91 @@ def test_tool_registry_returns_validation_error_for_bad_args(tmp_path: Path) -> 
     ))
     assert result.status == "failed"
     assert result.output["error"]["type"] == "validation_error"
+
+
+def test_tool_registry_enforces_budget_and_trace_id() -> None:
+    provider = _GovernedProvider()
+    registry = _build_governed_registry(
+        provider,
+        ToolRuntimePolicy(timeout_seconds=1.0, budget_group="governed", max_calls_per_run=1),
+    )
+    runtime_context: dict[str, object] = {}
+
+    first = _run(registry.execute(
+        call_id="c_budget_1",
+        tool_name="governed_tool",
+        raw_arguments={},
+        allowed_tools=["governed_tool"],
+        runtime_context=runtime_context,
+    ))
+    second = _run(registry.execute(
+        call_id="c_budget_2",
+        tool_name="governed_tool",
+        raw_arguments={},
+        allowed_tools=["governed_tool"],
+        runtime_context=runtime_context,
+    ))
+
+    assert first.status == "completed"
+    assert first.trace_id
+    assert second.trace_id == first.trace_id
+    assert second.status == "failed"
+    assert second.output["error"]["type"] == "budget_exceeded"
+    assert provider.calls == 1
+
+
+def test_tool_registry_retries_transient_failures() -> None:
+    provider = _GovernedProvider(fail_once=True)
+    registry = _build_governed_registry(
+        provider,
+        ToolRuntimePolicy(timeout_seconds=1.0, max_retries=1),
+    )
+
+    result = _run(registry.execute(
+        call_id="c_retry",
+        tool_name="governed_tool",
+        raw_arguments={"fallback_reason": "test fallback"},
+        allowed_tools=["governed_tool"],
+        runtime_context={},
+    ))
+
+    assert result.status == "completed"
+    assert result.attempt_count == 2
+    assert result.fallback_reason == "test fallback"
+    assert provider.calls == 2
+
+
+def test_tool_registry_opens_circuit_after_timeout() -> None:
+    provider = _GovernedProvider(delay_seconds=0.2)
+    registry = _build_governed_registry(
+        provider,
+        ToolRuntimePolicy(
+            timeout_seconds=0.01,
+            max_retries=0,
+            circuit_breaker_failures=1,
+            circuit_breaker_recovery_seconds=60.0,
+        ),
+    )
+
+    first = _run(registry.execute(
+        call_id="c_timeout",
+        tool_name="governed_tool",
+        raw_arguments={},
+        allowed_tools=["governed_tool"],
+        runtime_context={},
+    ))
+    second = _run(registry.execute(
+        call_id="c_circuit",
+        tool_name="governed_tool",
+        raw_arguments={},
+        allowed_tools=["governed_tool"],
+        runtime_context={},
+    ))
+
+    assert first.status == "failed"
+    assert first.output["error"]["type"] == "timeout"
+    assert second.status == "failed"
+    assert second.output["error"]["type"] == "circuit_open"
 
 
 def test_tool_registry_can_lookup_one_shop(tmp_path: Path) -> None:

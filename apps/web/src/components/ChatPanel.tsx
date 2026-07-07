@@ -1,5 +1,7 @@
 import { ChangeEvent, Fragment, FormEvent, useEffect, useMemo, useRef } from "react";
+import { chatLifecycleStatusText, isChatLifecycleBusy } from "../lib/chatLifecycle";
 import { formatSubagentLabel, formatTimeLabel } from "../lib/chatStream";
+import { hasRenderableMapArtifacts } from "../lib/mapArtifacts";
 import { useAppStore } from "../stores/appStore";
 import type { ChatAttachment } from "../types";
 import { MarkdownMessage } from "./MarkdownMessage";
@@ -28,7 +30,7 @@ export function ChatPanel({
 }: ChatPanelProps) {
   const turns = useAppStore((state) => state.turns);
   const loading = useAppStore((state) => state.turnsLoading);
-  const sending = useAppStore((state) => state.sending);
+  const chatLifecycle = useAppStore((state) => state.chatLifecycle);
   const inputValue = useAppStore((state) => state.inputValue);
   const setInputValue = useAppStore((state) => state.setInputValue);
   const pendingChatFiles = useAppStore((state) => state.pendingChatFiles);
@@ -36,10 +38,8 @@ export function ChatPanel({
   const setPendingChatAttachments = useAppStore((state) => state.setPendingChatAttachments);
   const setPendingChatFiles = useAppStore((state) => state.setPendingChatFiles);
   const error = useAppStore((state) => state.chatError);
-  const streamConnected = useAppStore((state) => state.streamConnected);
   const activeSubagent = useAppStore((state) => state.activeSubagent);
   const streamItems = useAppStore((state) => state.streamItems);
-  const awaitingAssistant = useAppStore((state) => state.awaitingAssistant);
   const mapArtifacts = useAppStore((state) => state.activeMapArtifacts);
   const endRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -54,13 +54,13 @@ export function ChatPanel({
       return turns;
     }
 
-    const hasStreamingContext =
-      awaitingAssistant || sending || streamConnected || streamReplyActive || streamReplyTarget.trim().length > 0;
+    const lifecycleBusy = isChatLifecycleBusy(chatLifecycle);
+    const hasStreamingContext = lifecycleBusy || streamReplyActive || streamReplyTarget.trim().length > 0;
     if (!hasStreamingContext) {
       return turns;
     }
 
-    if (awaitingAssistant) {
+    if (lifecycleBusy) {
       return turns.slice(0, -1);
     }
 
@@ -78,7 +78,7 @@ export function ChatPanel({
     }
 
     return turns;
-  }, [awaitingAssistant, sending, streamConnected, streamReplyActive, streamReplyTarget, turns]);
+  }, [chatLifecycle, streamReplyActive, streamReplyTarget, turns]);
 
   const lastAssistantReply = useMemo(() => {
     for (let idx = turnsForRender.length - 1; idx >= 0; idx -= 1) {
@@ -93,29 +93,22 @@ export function ChatPanel({
   const showStreamReply =
     streamReply.trim().length > 0 &&
     (streamReplyActive || !lastAssistantReply || !lastAssistantReply.startsWith(streamReply));
-  const showStreamStage = streamItems.length > 0 || sending || streamConnected || streamReplyActive || awaitingAssistant;
-  const showStreamingBubble = showStreamReply || awaitingAssistant;
-  const showMapCard = Boolean(
-    mapArtifacts && (mapArtifacts.route || mapArtifacts.shops.length > 0 || mapArtifacts.view_payload)
-  );
+  const lifecycleBusy = isChatLifecycleBusy(chatLifecycle);
+  const showStreamStage = streamItems.length > 0 || lifecycleBusy || streamReplyActive;
+  const showStreamingBubble = showStreamReply || lifecycleBusy;
+  const showMapCard = hasRenderableMapArtifacts(mapArtifacts);
   const showEmptyState = turns.length === 0 && !showStreamingBubble && !showStreamStage && !showMapCard;
   const latestStreamItem = streamItems.length ? streamItems[streamItems.length - 1] : null;
-  const composerBusy = sending || awaitingAssistant;
+  const composerBusy = lifecycleBusy;
   const hasPendingAttachments = pendingChatAttachments.length > 0;
   const stageStatusText =
     latestStreamItem?.text
-    ?? (streamConnected
-      ? "等待阶段事件..."
-      : sending
-        ? "连接中..."
-        : awaitingAssistant
-          ? "等待会话继续..."
-          : "阶段已结束");
+    ?? chatLifecycleStatusText(chatLifecycle);
   const stageStatusMeta = latestStreamItem ? formatTimeLabel(latestStreamItem.at) : "实时同步中...";
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [turnsForRender, loading, sending, streamItems, streamReply, awaitingAssistant, showStreamStage, showMapCard]);
+  }, [turnsForRender, loading, chatLifecycle, streamItems, streamReply, showStreamStage, showMapCard]);
 
   useEffect(() => {
     return () => {
@@ -301,7 +294,7 @@ export function ChatPanel({
                   <div className="chat-bubble chat-event-bubble">
                     <div className="chat-stage-live-head">
                       <span
-                        className={`chat-stage-live-dot ${streamConnected || sending || awaitingAssistant ? "is-live" : ""}`}
+                        className={`chat-stage-live-dot ${lifecycleBusy ? "is-live" : ""}`}
                         aria-hidden="true"
                       />
                       <strong>{formatSubagentLabel(activeSubagent)}</strong>
@@ -378,7 +371,7 @@ export function ChatPanel({
           disabled={composerBusy}
         />
         <button type="submit" disabled={composerBusy || (inputValue.trim().length === 0 && !hasPendingAttachments)}>
-          {sending ? "发送中..." : awaitingAssistant ? "处理中..." : "发送"}
+          {chatLifecycle === "dispatching" ? "发送中..." : composerBusy ? "处理中..." : "发送"}
         </button>
         <div className="chat-composer-hint">
           支持把检索、路线、知识库问题和上传附件放在一次对话里一起提交。

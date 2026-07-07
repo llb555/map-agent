@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 IntentType = Literal["search_nearby", "navigate", "search"]
@@ -14,6 +14,8 @@ ChatSessionStatusType = Literal["idle", "running", "completed", "failed"]
 CoordSystemType = Literal["gcj02", "wgs84"]
 GeoSourceType = Literal["catalog", "geocode", "client", "route"]
 GeoPrecisionType = Literal["exact", "approx"]
+KnowledgeIndexStatusType = Literal["pending", "indexing", "ready", "failed"]
+MapArtifactSceneType = Literal["agent_candidates", "agent_route"]
 
 
 class Location(BaseModel):
@@ -165,6 +167,12 @@ class KnowledgeFileItemDto(BaseModel):
     suffix: str
     size_bytes: int
     updated_at: float
+    status: KnowledgeIndexStatusType = "pending"
+    chunk_count: int = 0
+    content_hash: str | None = None
+    indexed_at: float | None = None
+    error: str | None = None
+    job_id: str | None = None
 
 
 class KnowledgeStatusDto(BaseModel):
@@ -180,6 +188,12 @@ class KnowledgeStatusDto(BaseModel):
     hybrid_search_enabled: bool
     index_ready: bool
     chunk_count: int
+    pending_count: int = 0
+    indexing_count: int = 0
+    ready_count: int = 0
+    failed_count: int = 0
+    job_count: int = 0
+    active_job_id: str | None = None
     load_error: str | None = None
     files: list[KnowledgeFileItemDto] = Field(default_factory=list)
 
@@ -232,6 +246,7 @@ class KnowledgeLookupResponseDto(BaseModel):
 class RouteSummaryDto(BaseModel):
     """Route plan payload returned by navigation flow."""
 
+    schema_version: int = 1
     provider: ProviderType
     mode: str
     distance_m: int | None = None
@@ -256,6 +271,38 @@ class RouteSummaryDto(BaseModel):
         return payload
 
 
+class MapViewPayloadDto(BaseModel):
+    """Versioned map view metadata for frontend renderers."""
+
+    schema_version: int = 1
+    scene: MapArtifactSceneType
+    title: str | None = None
+
+    model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_view_payload(cls, raw: object) -> object:
+        if not isinstance(raw, dict):
+            return raw
+        payload = dict(raw)
+        version = payload.pop("version", None)
+        payload.setdefault("schema_version", version if isinstance(version, int) else 1)
+        return payload
+
+
+class MapArtifactDto(BaseModel):
+    """Versioned aggregate map artifact exposed to the web renderer."""
+
+    schema_version: int = 1
+    scene: MapArtifactSceneType
+    shops: list[ArcadeShopSummaryDto] = Field(default_factory=list)
+    route: RouteSummaryDto | None = None
+    client_location: ClientLocationContext | None = None
+    destination: ArcadeShopSummaryDto | None = None
+    view_payload: MapViewPayloadDto | None = None
+
+
 class ChatAttachmentDto(BaseModel):
     """One uploaded attachment accompanying a chat turn."""
 
@@ -273,6 +320,7 @@ class ChatRequest(BaseModel):
 
     session_id: str | None = None
     client_id: str | None = Field(default=None, min_length=1, max_length=128)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=128)
     message: str = Field(default="", max_length=2000)
     intent: IntentType | None = None
     shop_id: int | None = None
@@ -299,6 +347,7 @@ class ChatResponse(BaseModel):
     reply: str
     shops: list[ArcadeShopSummaryDto] = Field(default_factory=list)
     route: RouteSummaryDto | None = None
+    map_artifact: MapArtifactDto | None = None
 
 
 class ChatSessionDispatchDto(BaseModel):
@@ -306,6 +355,9 @@ class ChatSessionDispatchDto(BaseModel):
 
     session_id: str
     status: ChatSessionStatusType
+    run_status: ChatSessionStatusType = "running"
+    idempotency_key: str | None = None
+    last_stream_offset: int = 0
 
 
 class ChatHistoryTurnDto(BaseModel):
@@ -339,13 +391,17 @@ class ChatSessionDetailDto(BaseModel):
     intent: IntentType
     active_subagent: str
     status: ChatSessionStatusType
+    run_status: ChatSessionStatusType = "idle"
+    idempotency_key: str | None = None
+    last_stream_offset: int = 0
     last_error: str | None = None
     reply: str | None = None
     shops: list[ArcadeShopSummaryDto] = Field(default_factory=list)
     route: RouteSummaryDto | None = None
     client_location: ClientLocationContext | None = None
     destination: ArcadeShopSummaryDto | None = None
-    view_payload: dict[str, Any] | None = None
+    view_payload: MapViewPayloadDto | None = None
+    map_artifact: MapArtifactDto | None = None
     turn_count: int
     created_at: str
     updated_at: str

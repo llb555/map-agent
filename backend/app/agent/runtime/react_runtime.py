@@ -32,7 +32,10 @@ from app.infra.observability.logger import get_logger
 from app.protocol.messages import (
     ChatRequest,
     ChatResponse,
+    ClientLocationContext,
     IntentType,
+    MapArtifactDto,
+    MapViewPayloadDto,
 )
 from app.services.arcade_payload_mapper import ArcadePayloadMapper
 
@@ -142,6 +145,7 @@ class ReactRuntime:
         state = self._session_store.get_or_create(session_id)
         self._bind_client_scope(state, client_id)
         state.status = "running"
+        state.run_status = "running"
         state.last_error = None
         state.updated_at = _utc_now_iso()
         state.working_memory = ensure_working_memory_shape(state.working_memory)
@@ -154,6 +158,7 @@ class ReactRuntime:
         state = self._session_store.get_or_create(session_id)
         self._bind_client_scope(state, request.client_id)
         state.status = "running"
+        state.run_status = "running"
         state.last_error = None
         state.updated_at = _utc_now_iso()
         state.working_memory = ensure_working_memory_shape(state.working_memory)
@@ -163,6 +168,7 @@ class ReactRuntime:
         except Exception as exc:
             error_message = _short(f"{type(exc).__name__}: {exc}", limit=280) if str(exc) else type(exc).__name__
             state.status = "failed"
+            state.run_status = "failed"
             state.last_error = error_message
             state.working_memory["last_error"] = {"message": error_message}
             state.updated_at = _utc_now_iso()
@@ -287,6 +293,7 @@ class ReactRuntime:
         )
         state.active_subagent = "main_agent"
         state.status = "completed"
+        state.run_status = "completed"
         state.last_error = None
         state.working_memory["reply"] = final_text
         state.updated_at = _utc_now_iso()
@@ -392,6 +399,7 @@ class ReactRuntime:
         persist: bool = True,
     ) -> None:
         for call in tool_calls:
+            trace_id = self._ensure_tool_trace_id(session_state.working_memory)
             prepared_args, hydrated_fields = await self._tool_registry.prepare_arguments(
                 tool_name=call.name,
                 raw_arguments=call.arguments,
@@ -421,6 +429,7 @@ class ReactRuntime:
                     "call_id": call.call_id,
                     "active_subagent": profile.name,
                     "worker_run_id": worker_run_id,
+                    "trace_id": trace_id,
                 },
             )
             result = await self._tool_registry.execute(
@@ -428,6 +437,7 @@ class ReactRuntime:
                 tool_name=call.name,
                 raw_arguments=prepared_args,
                 allowed_tools=profile.allowed_tools,
+                runtime_context=session_state.working_memory,
             )
             if result.status == "completed" and result.tool_name == "invoke_worker":
                 envelope = await self._run_worker(
@@ -443,6 +453,12 @@ class ReactRuntime:
                     status="completed",
                     output=envelope,
                     error_message=None,
+                    trace_id=result.trace_id,
+                    tool_trace_id=result.tool_trace_id,
+                    attempt_count=result.attempt_count,
+                    duration_ms=result.duration_ms,
+                    fallback_reason=result.fallback_reason,
+                    governance=result.governance,
                 )
             self._record_tool_result(
                 session_id=session_id,
@@ -671,11 +687,25 @@ class ReactRuntime:
                 "call_id": result.call_id,
                 "active_subagent": agent_name,
                 "worker_run_id": worker_run_id,
+                "trace_id": result.trace_id,
+                "tool_trace_id": result.tool_trace_id,
+                "attempt_count": result.attempt_count,
+                "duration_ms": result.duration_ms,
             }
+            if result.fallback_reason:
+                payload["fallback_reason"] = result.fallback_reason
             route = result.output.get("route")
             if isinstance(route, dict):
                 payload["distance_m"] = route.get("distance_m")
-                self._replay_buffer.append(session_id, "navigation.route_ready", route)
+                route_payload = dict(route)
+                route_payload.setdefault("schema_version", 1)
+                route_payload["active_subagent"] = agent_name
+                route_payload["trace_id"] = result.trace_id
+                if result.fallback_reason:
+                    route_payload["fallback_reason"] = result.fallback_reason
+                if worker_run_id:
+                    route_payload["worker_run_id"] = worker_run_id
+                self._replay_buffer.append(session_id, "navigation.route_ready", route_payload)
             self._replay_buffer.append(session_id, "tool.completed", payload)
             logger.info(
                 "tool.completed session_id=%s tool=%s agent=%s",
@@ -694,6 +724,10 @@ class ReactRuntime:
                     "error": error_message,
                     "active_subagent": agent_name,
                     "worker_run_id": worker_run_id,
+                    "trace_id": result.trace_id,
+                    "tool_trace_id": result.tool_trace_id,
+                    "attempt_count": result.attempt_count,
+                    "duration_ms": result.duration_ms,
                 },
             )
             logger.warning(
@@ -718,6 +752,12 @@ class ReactRuntime:
                     "status": result.status,
                     "result": result.output,
                     "arguments": deepcopy(tool_arguments) if isinstance(tool_arguments, dict) else {},
+                    "trace_id": result.trace_id,
+                    "tool_trace_id": result.tool_trace_id,
+                    "attempt_count": result.attempt_count,
+                    "duration_ms": result.duration_ms,
+                    "fallback_reason": result.fallback_reason,
+                    "governance": deepcopy(result.governance) if isinstance(result.governance, dict) else {},
                 },
             ),
             persist=persist,
@@ -729,10 +769,12 @@ class ReactRuntime:
         if result.status != "completed":
             error_payload = result.output.get("error")
             memory["last_error"] = error_payload if error_payload is not None else result.error_message
+            self._append_tool_trace(memory, result=result)
             state.updated_at = _utc_now_iso()
             return
 
         memory.pop("last_error", None)
+        self._append_tool_trace(memory, result=result)
 
         if result.tool_name == "invoke_worker":
             envelope = result.output if isinstance(result.output, dict) else {}
@@ -748,7 +790,13 @@ class ReactRuntime:
                     set_working_memory_artifact(memory, "route", route)
                 view_payload = result_payload.get("view_payload")
                 if isinstance(view_payload, dict):
-                    set_working_memory_artifact(memory, "view_payload", view_payload)
+                    normalized_view_payload = dict(view_payload)
+                    if "schema_version" not in normalized_view_payload and isinstance(normalized_view_payload.get("version"), int):
+                        normalized_view_payload["schema_version"] = normalized_view_payload["version"]
+                    normalized_view_payload.setdefault("schema_version", 1)
+                    if normalized_view_payload.get("scene") not in {"agent_route", "agent_candidates"}:
+                        normalized_view_payload["scene"] = "agent_route" if isinstance(route, dict) else "agent_candidates"
+                    set_working_memory_artifact(memory, "view_payload", normalized_view_payload)
             return
 
         if result.tool_name == "db_query_tool":
@@ -835,7 +883,15 @@ class ReactRuntime:
     def _build_worker_memory_snapshot(self, parent_memory: dict[str, Any]) -> dict[str, Any]:
         memory = ensure_working_memory_shape({})
         parent_memory = ensure_working_memory_shape(parent_memory)
-        for key in ("last_request", "last_shop_id", "keyword", "last_db_query", "last_knowledge_query", "provider"):
+        for key in (
+            "last_request",
+            "last_shop_id",
+            "keyword",
+            "last_db_query",
+            "last_knowledge_query",
+            "provider",
+            "tool_trace_id",
+        ):
             if key in parent_memory:
                 memory[key] = deepcopy(parent_memory[key])
         for key in ("shop", "shops", "total", "route", "resolved_locations", "client_location", "destination", "view_payload", "knowledge_hits"):
@@ -867,6 +923,18 @@ class ReactRuntime:
             parent_memory["keyword"] = worker_memory["keyword"]
         if isinstance(worker_memory.get("last_mcp_result"), dict):
             parent_memory["last_mcp_result"] = deepcopy(worker_memory["last_mcp_result"])
+        if isinstance(worker_memory.get("tool_trace"), list):
+            trace = parent_memory.setdefault("tool_trace", [])
+            if isinstance(trace, list):
+                trace.extend(deepcopy(worker_memory["tool_trace"]))
+                if len(trace) > 80:
+                    del trace[:-80]
+        if isinstance(worker_memory.get("tool_fallbacks"), list):
+            fallbacks = parent_memory.setdefault("tool_fallbacks", [])
+            if isinstance(fallbacks, list):
+                fallbacks.extend(deepcopy(worker_memory["tool_fallbacks"]))
+                if len(fallbacks) > 40:
+                    del fallbacks[:-40]
         return promoted
 
     async def _maybe_backfill_search_worker_knowledge(
@@ -902,7 +970,23 @@ class ReactRuntime:
             tool_name="knowledge_search_tool",
             raw_arguments=prepared_args,
             allowed_tools=worker_profile.allowed_tools,
+            runtime_context=worker_state.working_memory,
         )
+        if result.status == "completed":
+            result.output.setdefault("fallback_reason", "structured_search_empty")
+            result = ToolExecutionResult(
+                call_id=result.call_id,
+                tool_name=result.tool_name,
+                status=result.status,
+                output=result.output,
+                error_message=result.error_message,
+                trace_id=result.trace_id,
+                tool_trace_id=result.tool_trace_id,
+                attempt_count=result.attempt_count,
+                duration_ms=result.duration_ms,
+                fallback_reason="structured_search_empty",
+                governance=result.governance,
+            )
         self._record_tool_result(
             session_id=session_id,
             state=worker_state,
@@ -1135,6 +1219,26 @@ class ReactRuntime:
         route_obj = self._arcade_payload_mapper.route_from_payload(
             get_working_memory_artifact(state.working_memory, "route")
         )
+        client_location = self._memory_client_location(state.working_memory)
+        destination_raw = get_working_memory_artifact(state.working_memory, "destination")
+        if not isinstance(destination_raw, dict) and route_obj is not None:
+            destination_raw = raw_shops[0] if raw_shops else None
+        destination = (
+            await asyncio.to_thread(self._arcade_payload_mapper.summary_from_row, destination_raw)
+            if isinstance(destination_raw, dict)
+            else None
+        )
+        view_payload = self._map_view_payload(
+            get_working_memory_artifact(state.working_memory, "view_payload"),
+            has_route=route_obj is not None,
+        )
+        map_artifact = self._map_artifact(
+            shops=shops,
+            route=route_obj,
+            client_location=client_location,
+            destination=destination,
+            view_payload=view_payload,
+        )
 
         intent = _normalize_intent(state.intent)
         if route_obj is not None:
@@ -1145,6 +1249,52 @@ class ReactRuntime:
             reply=final_text,
             shops=shops,
             route=route_obj,
+            map_artifact=map_artifact,
+        )
+
+    def _memory_client_location(self, memory: dict[str, Any]) -> ClientLocationContext | None:
+        raw = get_working_memory_artifact(memory, "client_location")
+        if not isinstance(raw, dict):
+            return None
+        try:
+            return ClientLocationContext.model_validate(raw)
+        except Exception:
+            return None
+
+    def _map_view_payload(self, raw: Any, *, has_route: bool) -> MapViewPayloadDto | None:
+        fallback_scene = "agent_route" if has_route else "agent_candidates"
+        if isinstance(raw, dict):
+            payload = dict(raw)
+            if payload.get("scene") not in {"agent_route", "agent_candidates"}:
+                payload["scene"] = fallback_scene
+            try:
+                return MapViewPayloadDto.model_validate(payload)
+            except Exception:
+                return None
+        if has_route:
+            return MapViewPayloadDto(schema_version=1, scene="agent_route")
+        return None
+
+    def _map_artifact(
+        self,
+        *,
+        shops: list[Any],
+        route: Any,
+        client_location: ClientLocationContext | None,
+        destination: Any,
+        view_payload: MapViewPayloadDto | None,
+    ) -> MapArtifactDto | None:
+        if not shops and route is None and destination is None and view_payload is None:
+            return None
+        scene = view_payload.scene if view_payload is not None else ("agent_route" if route is not None else "agent_candidates")
+        return MapArtifactDto(
+            schema_version=1,
+            scene=scene,
+            shops=shops,
+            route=route,
+            client_location=client_location,
+            destination=destination,
+            view_payload=view_payload,
         )
 
     def _memory_shops(self, memory: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1164,7 +1314,47 @@ class ReactRuntime:
         prepared = ensure_working_memory_shape(memory)
         prepared.pop("reply", None)
         prepared["assistant_token_emitted"] = False
+        prepared["tool_trace_id"] = f"trc_{uuid4().hex[:12]}"
+        prepared["tool_budget"] = {"tools": {}, "groups": {}}
+        prepared["tool_trace"] = []
+        prepared["tool_fallbacks"] = []
         return prepared
+
+    def _ensure_tool_trace_id(self, memory: dict[str, Any]) -> str:
+        trace_id = memory.get("tool_trace_id")
+        if isinstance(trace_id, str) and trace_id:
+            return trace_id
+        trace_id = f"trc_{uuid4().hex[:12]}"
+        memory["tool_trace_id"] = trace_id
+        return trace_id
+
+    def _append_tool_trace(self, memory: dict[str, Any], *, result: ToolExecutionResult) -> None:
+        trace_item = {
+            "tool": result.tool_name,
+            "call_id": result.call_id,
+            "status": result.status,
+            "trace_id": result.trace_id,
+            "tool_trace_id": result.tool_trace_id,
+            "attempt_count": result.attempt_count,
+            "duration_ms": result.duration_ms,
+            "fallback_reason": result.fallback_reason,
+        }
+        trace = memory.setdefault("tool_trace", [])
+        if isinstance(trace, list):
+            trace.append(trace_item)
+            if len(trace) > 80:
+                del trace[:-80]
+        if result.fallback_reason:
+            fallbacks = memory.setdefault("tool_fallbacks", [])
+            if isinstance(fallbacks, list):
+                fallbacks.append({
+                    "tool": result.tool_name,
+                    "call_id": result.call_id,
+                    "reason": result.fallback_reason,
+                    "trace_id": result.trace_id,
+                })
+                if len(fallbacks) > 40:
+                    del fallbacks[:-40]
 
     def _bind_client_scope(self, state: AgentSessionState, client_id: str | None) -> None:
         """Attach a browser-owned client id to new sessions and reject cross-client writes."""

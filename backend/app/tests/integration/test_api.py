@@ -77,6 +77,10 @@ def _clear_rag_env() -> None:
         "RAG_RERANKER_TIMEOUT_SECONDS",
         "RAG_HYBRID_SEARCH_ENABLED",
         "RAG_HYBRID_ALPHA",
+        "RAG_QUERY_CACHE_ENABLED",
+        "RAG_QUERY_CACHE_MAX_ENTRIES",
+        "RAG_QUERY_CACHE_TTL_SECONDS",
+        "RAG_SNAPSHOT_PATH",
     ):
         os.environ.pop(name, None)
 
@@ -106,6 +110,7 @@ def _build_client(
     os.environ["AMAP_API_KEY"] = "test-amap-key"
     os.environ["MCP_SERVERS_DIR"] = str(mcp_servers_dir or empty_mcp_dir)
     os.environ["RAG_ENABLED"] = "false"
+    os.environ["RAG_SNAPSHOT_PATH"] = str(tmp_path / "rag_snapshot.json")
     if rag_env:
         os.environ.update(rag_env)
 
@@ -144,6 +149,7 @@ def _build_client_with_rows(
     os.environ["AMAP_API_KEY"] = "test-amap-key"
     os.environ["MCP_SERVERS_DIR"] = str(empty_mcp_dir)
     os.environ["RAG_ENABLED"] = "false"
+    os.environ["RAG_SNAPSHOT_PATH"] = str(tmp_path / "rag_snapshot.json")
     if rag_env:
         os.environ.update(rag_env)
 
@@ -175,6 +181,21 @@ def _wait_for_session_status(
     raise AssertionError(
         f"session '{session_id}' did not reach status '{expected_status}', last_payload={last_payload}"
     )
+
+
+def _wait_for_knowledge_ready(client: TestClient, *, timeout_seconds: float = 3.0) -> dict[str, object]:
+    deadline = time.monotonic() + timeout_seconds
+    last_payload: dict[str, object] | None = None
+    while time.monotonic() < deadline:
+        resp = client.get("/api/knowledge/status")
+        if resp.status_code == 200:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                last_payload = payload
+                if payload.get("pending_count") == 0 and payload.get("indexing_count") == 0:
+                    return payload
+        time.sleep(0.05)
+    raise AssertionError(f"knowledge index did not become idle, last_payload={last_payload}")
 
 
 def test_health_arcades_and_chat(tmp_path: Path) -> None:
@@ -232,7 +253,7 @@ def test_regions_api_uses_region_service_with_store_fallback(tmp_path: Path) -> 
 
 
 def test_knowledge_upload_and_reindex(tmp_path: Path) -> None:
-    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-knowledge-upload"
+    knowledge_dir = tmp_path.resolve() / "knowledge-upload"
     client = _build_client(
         tmp_path,
         rag_env={
@@ -253,16 +274,22 @@ def test_knowledge_upload_and_reindex(tmp_path: Path) -> None:
     assert upload.status_code == 200
     upload_body = upload.json()
     assert upload_body["file"]["name"] == "guide.md"
-    assert upload_body["rag"]["chunk_count"] >= 1
+    assert upload_body["file"]["status"] in {"pending", "indexing", "ready"}
     assert (knowledge_dir / "guide.md").exists()
+    ready_after_upload = _wait_for_knowledge_ready(client)
+    assert ready_after_upload["chunk_count"] >= 1
+    guide = next(item for item in ready_after_upload["files"] if item["name"] == "guide.md")
+    assert guide["status"] == "ready"
+    assert guide["chunk_count"] >= 1
 
     reindex = client.post("/api/knowledge/reindex")
     assert reindex.status_code == 200
-    assert reindex.json()["index_ready"] is True
+    ready_after_reindex = _wait_for_knowledge_ready(client)
+    assert ready_after_reindex["index_ready"] is True
 
 
 def test_rag_warmup_builds_index_on_startup(tmp_path: Path) -> None:
-    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-rag-warmup-startup"
+    knowledge_dir = tmp_path.resolve() / "rag-warmup-startup"
     knowledge_dir.mkdir(parents=True, exist_ok=True)
     (knowledge_dir / "guide.md").write_text("# FAQ\n\nmaimai rules and hotel notes", encoding="utf-8")
     client = _build_client(
@@ -287,7 +314,7 @@ def test_rag_warmup_builds_index_on_startup(tmp_path: Path) -> None:
 
 
 def test_knowledge_delete_file_and_refresh_status(tmp_path: Path) -> None:
-    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-knowledge-delete"
+    knowledge_dir = tmp_path.resolve() / "knowledge-delete"
     client = _build_client(
         tmp_path,
         rag_env={
@@ -302,19 +329,19 @@ def test_knowledge_delete_file_and_refresh_status(tmp_path: Path) -> None:
         files={"file": ("delete-me.md", b"# Temp\n\nremove this file", "text/markdown")},
     )
     assert upload.status_code == 200
+    _wait_for_knowledge_ready(client)
     assert (knowledge_dir / "delete-me.md").exists()
 
     delete_resp = client.delete("/api/knowledge/files", params={"relative_path": "delete-me.md"})
     assert delete_resp.status_code == 204
     assert not (knowledge_dir / "delete-me.md").exists()
 
-    status_after = client.get("/api/knowledge/status")
-    assert status_after.status_code == 200
-    assert all(item["name"] != "delete-me.md" for item in status_after.json()["files"])
+    status_after = _wait_for_knowledge_ready(client)
+    assert all(item["name"] != "delete-me.md" for item in status_after["files"])
 
 
 def test_knowledge_batch_delete_files_and_refresh_status(tmp_path: Path) -> None:
-    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-knowledge-batch-delete"
+    knowledge_dir = tmp_path.resolve() / "knowledge-batch-delete"
     client = _build_client(
         tmp_path,
         rag_env={
@@ -334,6 +361,7 @@ def test_knowledge_batch_delete_files_and_refresh_status(tmp_path: Path) -> None
     )
     assert first.status_code == 200
     assert second.status_code == 200
+    _wait_for_knowledge_ready(client)
     assert (knowledge_dir / "first.md").exists()
     assert (knowledge_dir / "second.md").exists()
 
@@ -342,7 +370,7 @@ def test_knowledge_batch_delete_files_and_refresh_status(tmp_path: Path) -> None
         json={"relative_paths": ["first.md", "second.md"]},
     )
     assert batch_delete.status_code == 200
-    body = batch_delete.json()
+    body = _wait_for_knowledge_ready(client)
     assert body["index_ready"] is True
     assert all(item["name"] not in {"first.md", "second.md"} for item in body["files"])
     assert not (knowledge_dir / "first.md").exists()
@@ -350,7 +378,7 @@ def test_knowledge_batch_delete_files_and_refresh_status(tmp_path: Path) -> None
 
 
 def test_knowledge_lookup_returns_structured_arcade_candidates(tmp_path: Path) -> None:
-    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-knowledge-lookup-arcades"
+    knowledge_dir = tmp_path.resolve() / "knowledge-lookup-arcades"
     client = _build_client(
         tmp_path,
         rag_env={
@@ -398,7 +426,7 @@ def test_knowledge_lookup_returns_structured_arcade_candidates(tmp_path: Path) -
 
 
 def test_knowledge_lookup_returns_structured_arcade_candidates_from_document_text(tmp_path: Path) -> None:
-    knowledge_dir = Path.cwd() / "data" / "runtime" / "test-knowledge-lookup-doc-text"
+    knowledge_dir = tmp_path.resolve() / "knowledge-lookup-doc-text"
     client = _build_client(
         tmp_path,
         rag_env={
@@ -649,9 +677,14 @@ def test_chat_session_detail_supports_legacy_route_payload(tmp_path: Path) -> No
     assert resp.status_code == 200
     body = resp.json()
     assert body["route"]["origin"]["lng"] == 116.397428
+    assert body["route"]["schema_version"] == 1
     assert body["destination"]["source_id"] == 10
     assert "client_location" in body
     assert "view_payload" in body
+    assert body["view_payload"]["schema_version"] == 1
+    assert body["view_payload"]["scene"] == "agent_route"
+    assert body["map_artifact"]["schema_version"] == 1
+    assert body["map_artifact"]["scene"] == "agent_route"
 
 
 def test_health_reports_mcp_tools_loaded_from_config_directory(tmp_path: Path) -> None:
@@ -880,6 +913,45 @@ def test_chat_dispatch_rejects_duplicate_running_session(tmp_path: Path) -> None
     assert second_resp.status_code == 409
 
     _wait_for_session_status(client, session_id, "completed")
+
+
+def test_chat_dispatch_is_idempotent_for_duplicate_key(tmp_path: Path) -> None:
+    client = _build_client(tmp_path)
+    runtime = client.app.state.container.react_runtime
+    original_run_chat = runtime.run_chat
+    calls = 0
+
+    async def slow_run_chat(request):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.2)
+        return await original_run_chat(request)
+
+    runtime.run_chat = slow_run_chat  # type: ignore[method-assign]
+
+    session_id = "s_idem123"
+    payload = {
+        "session_id": session_id,
+        "idempotency_key": "idem-click-1",
+        "message": "find Gamma",
+        "page_size": 3,
+    }
+
+    first_resp = client.post("/api/chat/sessions", json=payload)
+    second_resp = client.post("/api/chat/sessions", json=payload)
+
+    assert first_resp.status_code == 202
+    assert second_resp.status_code == 202
+    assert first_resp.json()["session_id"] == second_resp.json()["session_id"] == session_id
+    assert second_resp.json()["idempotency_key"] == "idem-click-1"
+
+    detail = _wait_for_session_status(client, session_id, "completed")
+
+    assert calls == 1
+    assert detail["turn_count"] == 2
+    assert detail["idempotency_key"] == "idem-click-1"
+    assert detail["run_status"] == "completed"
+    assert detail["last_stream_offset"] > 0
 
 
 def test_arcades_api_supports_title_quantity_sorting(tmp_path: Path) -> None:

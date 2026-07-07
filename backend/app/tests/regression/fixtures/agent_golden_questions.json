@@ -1,0 +1,47 @@
+[
+  {
+    "id": "search_title_region",
+    "question": "帮我找上海附近的舞萌机厅",
+    "expected_intent": "search_nearby",
+    "expected_query": {
+      "title_name": "maimai",
+      "province_name": "上海",
+      "city_name": "上海"
+    }
+  },
+  {
+    "id": "nearby_place",
+    "question": "人广附近有舞萌吗",
+    "expected_intent": "search_nearby",
+    "expected_query": {
+      "title_name": "maimai",
+      "keyword": "人民广场",
+      "place_query": "人民广场"
+    }
+  },
+  {
+    "id": "navigate_explicit",
+    "question": "给我一条从当前位置到最近机厅的路线建议",
+    "expected_intent": "navigate",
+    "expected_query": {}
+  },
+  {
+    "id": "shop_detail",
+    "question": "请问星际传奇人民广场店现在怎么样",
+    "expected_intent": "search",
+    "expected_query": {
+      "shop_name": "星际传奇人民广场店"
+    }
+  },
+  {
+    "id": "county_title",
+    "question": "上海徐汇区附近有没有中二",
+    "expected_intent": "search_nearby",
+    "expected_query": {
+      "province_name": "上海",
+      "city_name": "上海",
+      "county_name": "徐汇区",
+      "title_name": "chunithm"
+    }
+  }
+]

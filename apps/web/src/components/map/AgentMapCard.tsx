@@ -6,7 +6,8 @@ import {
   normalizeRouteToGcj02
 } from "../../lib/amapCoords";
 import { buildAmapMarkerUri, buildAmapNavigationUri } from "../../lib/amapUri";
-import type { AgentMapScene, ArcadeSummary, ChatMapArtifacts, GeoPoint, RouteSummary } from "../../types";
+import { normalizeChatMapArtifacts } from "../../lib/mapArtifacts";
+import type { ArcadeSummary, ChatMapArtifacts, GeoPoint, RouteSummary } from "../../types";
 import { AmapMapCanvas, type AmapRuntime } from "./AmapMapCanvas";
 import { AmapRouteOverlay } from "./AmapRouteOverlay";
 import { AmapShopMarkers } from "./AmapShopMarkers";
@@ -24,14 +25,6 @@ type AgentMapCardProps = {
 function readPayloadString(payload: Record<string, unknown> | null | undefined, key: string): string | null {
   const value = payload?.[key];
   return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function readPayloadScene(payload: Record<string, unknown> | null | undefined): AgentMapScene | null {
-  const scene = readPayloadString(payload, "scene");
-  if (scene === "agent_candidates" || scene === "agent_route") {
-    return scene;
-  }
-  return null;
 }
 
 function routeModeToUriMode(mode?: string | null): "walk" | "car" {
@@ -97,47 +90,51 @@ function hasMapContent(artifacts: ChatMapArtifacts): boolean {
 }
 
 export function AgentMapCard({ artifacts }: AgentMapCardProps) {
+  const normalizedArtifacts = useMemo(() => normalizeChatMapArtifacts(artifacts), [artifacts]);
   const [mapRuntime, setMapRuntime] = useState<AmapRuntime | null>(null);
   const [mapStatus, setMapStatus] = useState<MapStatus>({ state: "idle", message: "" });
   const [selectedSourceId, setSelectedSourceId] = useState<number | null>(() => {
-    return artifacts.destination?.source_id ?? firstShopWithGeo(artifacts.shops)?.source_id ?? artifacts.shops[0]?.source_id ?? null;
+    const initial = normalizeChatMapArtifacts(artifacts);
+    return initial?.destination?.source_id ?? firstShopWithGeo(initial?.shops ?? [])?.source_id ?? initial?.shops[0]?.source_id ?? null;
   });
+  const renderArtifacts = normalizedArtifacts;
 
-  const normalizedRoute = useMemo(() => normalizeRouteToGcj02(artifacts.route), [artifacts.route]);
-  const scene = readPayloadScene(artifacts.view_payload) ?? (normalizedRoute ? "agent_route" : "agent_candidates");
+  const normalizedRoute = useMemo(() => normalizeRouteToGcj02(renderArtifacts?.route ?? null), [renderArtifacts?.route]);
+  const scene = renderArtifacts?.scene ?? (normalizedRoute ? "agent_route" : "agent_candidates");
   const hasRoute = scene === "agent_route" && Boolean(normalizedRoute);
-  const destination = artifacts.destination ?? findShop(artifacts.shops, selectedSourceId) ?? artifacts.shops[0] ?? null;
-  const selectedShop = findShop(artifacts.shops, selectedSourceId) ?? destination ?? firstShopWithGeo(artifacts.shops);
+  const shops = renderArtifacts?.shops ?? [];
+  const destination = renderArtifacts?.destination ?? findShop(shops, selectedSourceId) ?? shops[0] ?? null;
+  const selectedShop = findShop(shops, selectedSourceId) ?? destination ?? firstShopWithGeo(shops);
   const selectedPoint = getArcadeGcjPoint(selectedShop);
   const destinationPoint = routeDestinationPoint(normalizedRoute, destination);
-  const clientOrigin = artifacts.client_location ? approximateWgs84ToGcj02(artifacts.client_location) : null;
+  const clientOrigin = renderArtifacts?.client_location ? approximateWgs84ToGcj02(renderArtifacts.client_location) : null;
   const routeOrigin = normalizedRoute?.origin ?? clientOrigin;
   const fallbackShop = destination ?? selectedShop;
   const title =
-    readPayloadString(artifacts.view_payload, "title")
+    readPayloadString(renderArtifacts?.view_payload, "title")
     ?? (hasRoute
       ? `前往 ${destination?.name ?? "目标机厅"}`
-      : artifacts.shops.length
+      : shops.length
         ? "候选机厅地图"
         : "地图卡片");
   const subtitle = hasRoute
     ? `${routeModeLabel(normalizedRoute?.mode)} · ${formatDistance(normalizedRoute?.distance_m)} · ${formatDuration(normalizedRoute?.duration_s)}`
-    : `${artifacts.shops.length} 个候选机厅，${artifacts.shops.filter((shop) => getArcadeGcjPoint(shop)).length} 个可定位`;
+    : `${shops.length} 个候选机厅，${shops.filter((shop) => getArcadeGcjPoint(shop)).length} 个可定位`;
   const mapCenter = hasRoute
     ? destinationPoint ?? routeOrigin ?? selectedPoint
-    : selectedPoint ?? getArcadeGcjPoint(firstShopWithGeo(artifacts.shops));
+    : selectedPoint ?? getArcadeGcjPoint(firstShopWithGeo(shops));
   const mapZoom = hasRoute ? 13 : selectedPoint ? 14 : 11;
 
   useEffect(() => {
     const nextSelected =
-      artifacts.destination?.source_id ?? firstShopWithGeo(artifacts.shops)?.source_id ?? artifacts.shops[0]?.source_id ?? null;
+      renderArtifacts?.destination?.source_id ?? firstShopWithGeo(renderArtifacts?.shops ?? [])?.source_id ?? renderArtifacts?.shops[0]?.source_id ?? null;
     setSelectedSourceId((current) => {
-      if (current != null && artifacts.shops.some((shop) => shop.source_id === current)) {
+      if (current != null && (renderArtifacts?.shops ?? []).some((shop) => shop.source_id === current)) {
         return current;
       }
       return nextSelected;
     });
-  }, [artifacts.destination?.source_id, artifacts.shops]);
+  }, [renderArtifacts?.destination?.source_id, renderArtifacts?.shops]);
 
   const handleMapRuntimeChange = useCallback((runtime: AmapRuntime | null) => {
     setMapRuntime(runtime);
@@ -162,7 +159,7 @@ export function AgentMapCard({ artifacts }: AgentMapCardProps) {
             destination: target,
             destinationName,
             origin: routeOrigin,
-            originName: artifacts.client_location?.region_text || artifacts.client_location?.formatted_address || "我的位置",
+            originName: renderArtifacts?.client_location?.region_text || renderArtifacts?.client_location?.formatted_address || "我的位置",
             mode: routeModeToUriMode(normalizedRoute?.mode),
             callnative: false
           }),
@@ -175,7 +172,7 @@ export function AgentMapCard({ artifacts }: AgentMapCardProps) {
             destination: target,
             destinationName,
             origin: routeOrigin,
-            originName: artifacts.client_location?.region_text || artifacts.client_location?.formatted_address || "我的位置",
+            originName: renderArtifacts?.client_location?.region_text || renderArtifacts?.client_location?.formatted_address || "我的位置",
             mode: routeModeToUriMode(normalizedRoute?.mode),
             callnative: true
           }),
@@ -202,8 +199,8 @@ export function AgentMapCard({ artifacts }: AgentMapCardProps) {
       }
     ];
   }, [
-    artifacts.client_location?.formatted_address,
-    artifacts.client_location?.region_text,
+    renderArtifacts?.client_location?.formatted_address,
+    renderArtifacts?.client_location?.region_text,
     destination?.name,
     destinationPoint,
     hasRoute,
@@ -223,19 +220,19 @@ export function AgentMapCard({ artifacts }: AgentMapCardProps) {
     if (mapStatus.state === "loading") {
       return "地图加载中...";
     }
-    if (hasRoute && artifacts.route_pending) {
+    if (hasRoute && renderArtifacts?.route_pending) {
       return "路线事件已到达，正在等待最终回复补全文本。";
     }
     if (hasRoute && !destinationPoint) {
       return "路线已生成，但终点坐标暂不可用。";
     }
-    if (!hasRoute && !artifacts.shops.some((shop) => getArcadeGcjPoint(shop))) {
+    if (!hasRoute && !shops.some((shop) => getArcadeGcjPoint(shop))) {
       return "候选机厅暂时没有可地图定位的坐标。";
     }
     return "";
-  }, [artifacts.route_pending, artifacts.shops, destinationPoint, hasRoute, mapStatus]);
+  }, [renderArtifacts?.route_pending, shops, destinationPoint, hasRoute, mapStatus]);
 
-  if (!hasMapContent(artifacts)) {
+  if (!renderArtifacts || !hasMapContent(renderArtifacts)) {
     return null;
   }
 
@@ -250,7 +247,7 @@ export function AgentMapCard({ artifacts }: AgentMapCardProps) {
           <h3>{title}</h3>
           <span>{subtitle}</span>
         </div>
-        {artifacts.route_pending ? <small>渐进展示</small> : null}
+        {renderArtifacts.route_pending ? <small>渐进展示</small> : null}
       </div>
 
       <div className="agent-map-grid">
@@ -268,7 +265,7 @@ export function AgentMapCard({ artifacts }: AgentMapCardProps) {
           ) : (
             <AmapShopMarkers
               runtime={mapRuntime}
-              shops={artifacts.shops}
+              shops={shops}
               selectedSourceId={selectedSourceId}
               onSelectShop={(shop) => setSelectedSourceId(shop.source_id)}
             />
@@ -290,7 +287,7 @@ export function AgentMapCard({ artifacts }: AgentMapCardProps) {
             </div>
           ) : (
             <ul className="agent-candidate-list">
-              {artifacts.shops.slice(0, 6).map((shop) => {
+              {shops.slice(0, 6).map((shop) => {
                 const mapped = Boolean(getArcadeGcjPoint(shop));
                 const active = shop.source_id === selectedSourceId;
                 return (

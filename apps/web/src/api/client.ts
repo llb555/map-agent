@@ -17,6 +17,38 @@ import type {
   SortOrder
 } from "../types";
 
+export type RequestOptions = {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  traceId?: string;
+};
+
+export class ApiRequestError extends Error {
+  status: number;
+  requestLabel: string;
+  traceId: string | null;
+  detail: string;
+
+  constructor({
+    status,
+    requestLabel,
+    traceId,
+    detail
+  }: {
+    status: number;
+    requestLabel: string;
+    traceId: string | null;
+    detail: string;
+  }) {
+    super(`HTTP ${status}: ${requestLabel}${detail ? ` - ${detail}` : ""}`);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.requestLabel = requestLabel;
+    this.traceId = traceId;
+    this.detail = detail;
+  }
+}
+
 function resolveApiBase(): string {
   const fallback = typeof window !== "undefined" ? window.location.origin : "http://localhost:8000";
   const configured = import.meta.env.VITE_API_BASE?.trim();
@@ -30,6 +62,52 @@ function resolveApiBase(): string {
 }
 
 const API_BASE = resolveApiBase();
+const DEFAULT_REQUEST_TIMEOUT_MS = 20_000;
+
+function makeTraceId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `web_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  }
+  return `web_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function makeRequestSignal(options: RequestOptions = {}): {
+  signal?: AbortSignal;
+  traceId: string;
+  cleanup: () => void;
+} {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const traceId = options.traceId || makeTraceId();
+  if (!timeoutMs || timeoutMs <= 0) {
+    return { signal: options.signal, traceId, cleanup: () => undefined };
+  }
+
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(options.signal?.reason);
+  const timer = setTimeout(() => controller.abort(new DOMException("Request timed out", "TimeoutError")), timeoutMs);
+  if (options.signal) {
+    if (options.signal.aborted) {
+      onAbort();
+    } else {
+      options.signal.addEventListener("abort", onAbort, { once: true });
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    traceId,
+    cleanup: () => {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
+    }
+  };
+}
+
+function requestHeaders(options: RequestOptions = {}, traceId?: string): HeadersInit {
+  return {
+    ...(traceId || options.traceId ? { "X-Request-Trace-Id": traceId || options.traceId || "" } : {})
+  };
+}
 
 function buildUrl(path: string, query?: Record<string, string | number | boolean | undefined | null>): string {
   const url = new URL(path, API_BASE);
@@ -49,7 +127,12 @@ async function parseJsonResponse<T>(resp: Response, requestLabel: string): Promi
 
   if (!resp.ok) {
     const detail = text.trim().slice(0, 180);
-    throw new Error(`HTTP ${resp.status}: ${requestLabel}${detail ? ` - ${detail}` : ""}`);
+    throw new ApiRequestError({
+      status: resp.status,
+      requestLabel,
+      traceId: resp.headers.get("x-request-trace-id"),
+      detail
+    });
   }
 
   if (!contentType.includes("application/json")) {
@@ -69,37 +152,69 @@ async function parseJsonResponse<T>(resp: Response, requestLabel: string): Promi
   }
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const resp = await fetch(url);
-  return parseJsonResponse<T>(resp, url);
+async function fetchJson<T>(url: string, options: RequestOptions = {}): Promise<T> {
+  const request = makeRequestSignal(options);
+  try {
+    const resp = await fetch(url, {
+      signal: request.signal,
+      headers: requestHeaders(options, request.traceId)
+    });
+    return parseJsonResponse<T>(resp, url);
+  } finally {
+    request.cleanup();
+  }
 }
 
-async function postJson<T>(path: string, payload: unknown): Promise<T> {
-  const resp = await fetch(buildUrl(path), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
-  return parseJsonResponse<T>(resp, path);
+async function postJson<T>(path: string, payload: unknown, options: RequestOptions = {}): Promise<T> {
+  const request = makeRequestSignal(options);
+  try {
+    const resp = await fetch(buildUrl(path), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...requestHeaders(options, request.traceId)
+      },
+      signal: request.signal,
+      body: JSON.stringify(payload)
+    });
+    return parseJsonResponse<T>(resp, path);
+  } finally {
+    request.cleanup();
+  }
 }
 
-async function postFormData<T>(path: string, formData: FormData): Promise<T> {
-  const resp = await fetch(buildUrl(path), {
-    method: "POST",
-    body: formData
-  });
-  return parseJsonResponse<T>(resp, path);
+async function postFormData<T>(path: string, formData: FormData, options: RequestOptions = {}): Promise<T> {
+  const request = makeRequestSignal({ timeoutMs: 60_000, ...options });
+  try {
+    const resp = await fetch(buildUrl(path), {
+      method: "POST",
+      headers: requestHeaders(options, request.traceId),
+      signal: request.signal,
+      body: formData
+    });
+    return parseJsonResponse<T>(resp, path);
+  } finally {
+    request.cleanup();
+  }
 }
 
 async function deleteJson(
   path: string,
-  query?: Record<string, string | number | boolean | undefined | null>
+  query?: Record<string, string | number | boolean | undefined | null>,
+  options: RequestOptions = {}
 ): Promise<void> {
-  const resp = await fetch(buildUrl(path, query), { method: "DELETE" });
-  if (!resp.ok) {
-    throw new Error(`HTTP ${resp.status}: ${path}`);
+  const request = makeRequestSignal(options);
+  try {
+    const resp = await fetch(buildUrl(path, query), {
+      method: "DELETE",
+      headers: requestHeaders(options, request.traceId),
+      signal: request.signal
+    });
+    if (!resp.ok) {
+      throw new Error(`HTTP ${resp.status}: ${path}`);
+    }
+  } finally {
+    request.cleanup();
   }
 }
 
@@ -119,24 +234,24 @@ export async function listArcades(params: {
   origin_coord_system?: "wgs84" | "gcj02";
   page?: number;
   page_size?: number;
-}): Promise<PagedArcades> {
-  return fetchJson<PagedArcades>(buildUrl("/api/arcades", params));
+}, options?: RequestOptions): Promise<PagedArcades> {
+  return fetchJson<PagedArcades>(buildUrl("/api/arcades", params), options);
 }
 
-export async function getArcadeDetail(sourceId: number): Promise<ArcadeDetail> {
-  return fetchJson<ArcadeDetail>(buildUrl(`/api/arcades/${sourceId}`));
+export async function getArcadeDetail(sourceId: number, options?: RequestOptions): Promise<ArcadeDetail> {
+  return fetchJson<ArcadeDetail>(buildUrl(`/api/arcades/${sourceId}`), options);
 }
 
-export async function listProvinces(): Promise<RegionItem[]> {
-  return fetchJson<RegionItem[]>(buildUrl("/api/regions/provinces"));
+export async function listProvinces(options?: RequestOptions): Promise<RegionItem[]> {
+  return fetchJson<RegionItem[]>(buildUrl("/api/regions/provinces"), options);
 }
 
-export async function listCities(provinceCode: string): Promise<RegionItem[]> {
-  return fetchJson<RegionItem[]>(buildUrl("/api/regions/cities", { province_code: provinceCode }));
+export async function listCities(provinceCode: string, options?: RequestOptions): Promise<RegionItem[]> {
+  return fetchJson<RegionItem[]>(buildUrl("/api/regions/cities", { province_code: provinceCode }), options);
 }
 
-export async function listCounties(cityCode: string): Promise<RegionItem[]> {
-  return fetchJson<RegionItem[]>(buildUrl("/api/regions/counties", { city_code: cityCode }));
+export async function listCounties(cityCode: string, options?: RequestOptions): Promise<RegionItem[]> {
+  return fetchJson<RegionItem[]>(buildUrl("/api/regions/counties", { city_code: cityCode }), options);
 }
 
 export async function sendChat(payload: ChatRequest): Promise<ChatResponse> {
@@ -151,6 +266,7 @@ export async function dispatchChatSessionWithUploads(payload: ChatRequest, files
   const formData = new FormData();
   formData.append("session_id", payload.session_id || "");
   formData.append("client_id", payload.client_id || "");
+  formData.append("idempotency_key", payload.idempotency_key || "");
   formData.append("message", payload.message || "");
   formData.append("page_size", String(payload.page_size || 5));
   if (payload.intent) {
@@ -211,8 +327,8 @@ export async function getKnowledgeStatus(): Promise<KnowledgeStatus> {
   return fetchJson<KnowledgeStatus>(buildUrl("/api/knowledge/status"));
 }
 
-export async function lookupKnowledge(query: string, topK = 3): Promise<KnowledgeLookupResponse> {
-  return fetchJson<KnowledgeLookupResponse>(buildUrl("/api/knowledge/lookup", { q: query, top_k: topK }));
+export async function lookupKnowledge(query: string, topK = 3, options?: RequestOptions): Promise<KnowledgeLookupResponse> {
+  return fetchJson<KnowledgeLookupResponse>(buildUrl("/api/knowledge/lookup", { q: query, top_k: topK }), options);
 }
 
 export async function reindexKnowledge(): Promise<KnowledgeStatus> {
@@ -223,6 +339,10 @@ export async function uploadKnowledgeFile(file: File): Promise<KnowledgeUploadRe
   const formData = new FormData();
   formData.append("file", file);
   return postFormData<KnowledgeUploadResponse>("/api/knowledge/upload", formData);
+}
+
+export async function retryKnowledgeFile(relativePath: string): Promise<KnowledgeStatus> {
+  return postJson<KnowledgeStatus>("/api/knowledge/files/retry", { relative_path: relativePath });
 }
 
 export async function deleteKnowledgeFile(relativePath: string): Promise<void> {

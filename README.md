@@ -127,6 +127,7 @@ SUPABASE_ANON_KEY=
 SUPABASE_SERVICE_ROLE_KEY=
 SUPABASE_TIMEOUT_SECONDS=8
 CHAT_SESSION_STORE_PATH=data/runtime/chat_sessions.json
+CHAT_STREAM_EVENT_STORE_PATH=data/runtime/chat_stream_events.jsonl
 
 LLM_API_KEY=
 LLM_BASE_URL=https://api.openai.com/v1
@@ -178,13 +179,13 @@ ARCADE_GEO_REQUEST_TIMEOUT_SECONDS=1.2
 - 如果想用本地真实 Transformer embedding，可以把 `RAG_EMBEDDING_MODEL` 设成 `sentence-transformers:<model-name>`，例如 `sentence-transformers:BAAI/bge-small-zh-v1.5`。
 - 若使用外部 embeddings API，`RAG_EMBEDDING_BASE_URL`、`RAG_EMBEDDING_API_KEY` 为空时会分别回退到 `LLM_BASE_URL`、`LLM_API_KEY`。
 - `RAG_VECTOR_BACKEND` 默认是 `memory`；设成 `faiss` 后会把知识库向量索引持久化到本地文件。
-- `RAG_FAISS_INDEX_PATH` 保存 `.faiss` 索引，`RAG_FAISS_METADATA_PATH` 保存 metadata sidecar。知识库上传/删除后仍然走当前的全量重建流程。
+- `RAG_FAISS_INDEX_PATH` 保存 `.faiss` 索引，`RAG_FAISS_METADATA_PATH` 保存 metadata sidecar。知识库上传/删除会进入后台增量索引队列，按文件状态追踪 `pending` / `indexing` / `ready` / `failed`，并复用未变化 Chunk 的 embedding。
 - `.jsonl` / `.json` 知识源建议至少包含 `content` 或 `text` 字段，可选 `title`、`source_uri`、`source_type` 元数据。
 - `.pdf` 知识源使用 `pypdf` 提取文本并按页索引；扫描版 PDF 若无内嵌文本，当前不会自动 OCR。
 - `.docx` 知识源会提取正文、表格、页眉页脚、批注和文本框中的文本后索引。
 - `.doc` 知识源会先自动转换为 `.docx` 再索引；优先使用 `soffice/libreoffice`，macOS 上可回退 `textutil`。
-- 前端现在提供“知识库”管理页，可直接上传上述格式文件到 `RAG_SOURCE_PATH` 并自动触发重建索引。
-- `CHAT_SESSION_STORE_PATH`、`ARCADE_GEO_CACHE_PATH` 会写入 `data/runtime/`，目录不存在时会自动创建。
+- 前端现在提供“知识库”管理页，可直接上传上述格式文件到 `RAG_SOURCE_PATH`，查看增量索引进度，并对失败文件单独重试。
+- `CHAT_SESSION_STORE_PATH`、`CHAT_STREAM_EVENT_STORE_PATH`、`ARCADE_GEO_CACHE_PATH` 会写入 `data/runtime/`，目录不存在时会自动创建；会话状态和 SSE 事件都会持久化，支持进程重启后的会话详情与流式事件续播。
 - `AMAP_API_KEY` 用于高德 REST 路线、逆地理编码和后端地理缓存；高德 Web JS API 的浏览器 key 需要单独配在前端。
 
 ### 4. 配置 MCP
@@ -493,6 +494,16 @@ npm run build
 cd apps/web
 npm run test:e2e
 ```
+
+Agent 回归与故障演练：
+
+```bash
+backend/.venv/bin/python backend/scripts/run_agent_regression.py
+cd apps/web
+npm run test:e2e:golden
+```
+
+详细说明见 `docs/dev-details/agent-regression-and-drills.md`。
 
 ## 故障排查
 

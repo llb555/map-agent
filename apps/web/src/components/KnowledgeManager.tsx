@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { deleteKnowledgeFile, deleteKnowledgeFilesBatch, getKnowledgeStatus, reindexKnowledge, uploadKnowledgeFile } from "../api/client";
+import {
+  deleteKnowledgeFile,
+  deleteKnowledgeFilesBatch,
+  getKnowledgeStatus,
+  reindexKnowledge,
+  retryKnowledgeFile,
+  uploadKnowledgeFile
+} from "../api/client";
 import type { KnowledgeFileItem, KnowledgeStatus } from "../types";
 
 function formatSize(size: number): string {
@@ -12,6 +19,17 @@ function formatDate(ts: number): string {
   return new Date(ts * 1000).toLocaleString();
 }
 
+const knowledgeStatusLabels: Record<KnowledgeFileItem["status"], string> = {
+  pending: "待索引",
+  indexing: "索引中",
+  ready: "已就绪",
+  failed: "失败"
+};
+
+function hasActiveIndexing(status: KnowledgeStatus | null): boolean {
+  return Boolean(status && (status.pending_count > 0 || status.indexing_count > 0));
+}
+
 export function KnowledgeManager() {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const [status, setStatus] = useState<KnowledgeStatus | null>(null);
@@ -19,6 +37,7 @@ export function KnowledgeManager() {
   const [uploading, setUploading] = useState(false);
   const [reindexing, setReindexing] = useState(false);
   const [deletingPath, setDeletingPath] = useState("");
+  const [retryingPath, setRetryingPath] = useState("");
   const [batchDeleting, setBatchDeleting] = useState(false);
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [message, setMessage] = useState("");
@@ -42,6 +61,18 @@ export function KnowledgeManager() {
   }, []);
 
   useEffect(() => {
+    if (!hasActiveIndexing(status)) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void getKnowledgeStatus()
+        .then(setStatus)
+        .catch((err) => setError(err instanceof Error ? err.message : "刷新知识库状态失败"));
+    }, 1200);
+    return () => window.clearInterval(timer);
+  }, [status?.pending_count, status?.indexing_count]);
+
+  useEffect(() => {
     setSelectedPaths((prev) => prev.filter((item) => status?.files.some((file) => file.relative_path === item)));
   }, [status]);
 
@@ -55,7 +86,7 @@ export function KnowledgeManager() {
     try {
       const result = await uploadKnowledgeFile(file);
       setStatus(result.rag);
-      setMessage(`已上传 ${result.file.name}，索引块数 ${result.rag.chunk_count}`);
+      setMessage(`已上传 ${result.file.name}，已加入后台索引队列`);
       if (inputRef.current) {
         inputRef.current.value = "";
       }
@@ -73,7 +104,7 @@ export function KnowledgeManager() {
     try {
       const next = await reindexKnowledge();
       setStatus(next);
-      setMessage(`索引已重建，当前块数 ${next.chunk_count}`);
+      setMessage(`已创建增量索引任务，当前队列 ${next.pending_count + next.indexing_count} 个文件待处理`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "重建索引失败");
     } finally {
@@ -89,7 +120,7 @@ export function KnowledgeManager() {
       await deleteKnowledgeFile(file.relative_path);
       const next = await getKnowledgeStatus();
       setStatus(next);
-      setMessage(`已删除 ${file.name}，当前剩余 ${next.files.length} 个文件`);
+      setMessage(`已删除 ${file.name}，后台正在移除对应 Chunk`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "删除失败");
     } finally {
@@ -109,11 +140,26 @@ export function KnowledgeManager() {
       const deletedCount = selectedPaths.length;
       setStatus(next);
       setSelectedPaths([]);
-      setMessage(`已批量删除 ${deletedCount} 个文件，当前剩余 ${next.files.length} 个文件`);
+      setMessage(`已批量删除 ${deletedCount} 个文件，后台正在同步索引`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "批量删除失败");
     } finally {
       setBatchDeleting(false);
+    }
+  }
+
+  async function handleRetry(file: KnowledgeFileItem) {
+    setRetryingPath(file.relative_path);
+    setError("");
+    setMessage("");
+    try {
+      const next = await retryKnowledgeFile(file.relative_path);
+      setStatus(next);
+      setMessage(`已重新提交 ${file.name} 的索引任务`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重试失败");
+    } finally {
+      setRetryingPath("");
     }
   }
 
@@ -157,16 +203,21 @@ export function KnowledgeManager() {
     const selectedSet = new Set(selectedPaths);
     return status.files.reduce((sum, file) => sum + (selectedSet.has(file.relative_path) ? file.size_bytes : 0), 0);
   }, [selectedPaths, status]);
+  const activeIndexing = hasActiveIndexing(status);
+  const processedCount = status ? status.ready_count + status.failed_count : 0;
+  const progressTotal = status ? Math.max(1, status.files.length) : 1;
+  const progressPercent = Math.round((processedCount / progressTotal) * 100);
 
   return (
     <section className="knowledge-shell">
       <div className="knowledge-hero browser-card">
         <small>Knowledge Base Control</small>
-        <h2>把文档上传进知识库，然后立即让 RAG 识别。</h2>
-        <p>支持 Markdown、TXT、JSON、JSONL、PDF、DOCX、DOC。上传成功后会自动重建索引。</p>
+        <h2>把知识文件变成可追踪的增量索引任务。</h2>
+        <p>上传、删除和重试都会进入后台队列；每个文件独立展示状态、Chunk 数和失败原因。</p>
         <div className="knowledge-hero-meta">
           <span className="knowledge-hero-pill">{status ? `${status.files.length} 个文件` : "等待文件清单"}</span>
           <span className="knowledge-hero-pill">{status ? `${status.chunk_count} 个 Chunk` : "等待索引状态"}</span>
+          <span className="knowledge-hero-pill">{status ? `${status.ready_count}/${status.files.length} 已就绪` : "等待任务状态"}</span>
           <span className="knowledge-hero-pill">{status ? featureSummary : "等待能力状态"}</span>
         </div>
       </div>
@@ -197,18 +248,32 @@ export function KnowledgeManager() {
               </div>
               <div className="knowledge-stat">
                 <span>索引状态</span>
-                <strong>{status.index_ready ? "已就绪" : "未就绪"}</strong>
-                <small>{status.enabled ? "RAG 已启用" : "RAG 当前未启用"}</small>
+                <strong>{activeIndexing ? "后台处理中" : status.index_ready ? "已就绪" : "需处理"}</strong>
+                <small>{status.enabled ? `${status.pending_count} 待处理 / ${status.indexing_count} 索引中` : "RAG 当前未启用"}</small>
               </div>
               <div className="knowledge-stat">
                 <span>Chunk 数量</span>
                 <strong>{status.chunk_count}</strong>
-                <small>上传或重建后实时更新</small>
+                <small>增量任务完成后实时更新</small>
               </div>
               <div className="knowledge-stat">
                 <span>文件体量</span>
                 <strong>{formatSize(totalSize)}</strong>
                 <small>{status.files.length ? "当前文件累计大小" : "还没有入库文件"}</small>
+              </div>
+            </div>
+          ) : null}
+
+          {status ? (
+            <div className="knowledge-progress">
+              <div className="knowledge-progress-copy">
+                <strong>{progressPercent}%</strong>
+                <span>
+                  {status.ready_count} ready · {status.pending_count} pending · {status.indexing_count} indexing · {status.failed_count} failed
+                </span>
+              </div>
+              <div className="knowledge-progress-track" aria-hidden="true">
+                <span style={{ width: `${progressPercent}%` }} />
               </div>
             </div>
           ) : null}
@@ -318,10 +383,24 @@ export function KnowledgeManager() {
                     <div className="knowledge-file-badges">
                       <span>{file.suffix}</span>
                       <span>{formatSize(file.size_bytes)}</span>
+                      <span className={`knowledge-index-badge is-${file.status}`}>
+                        {knowledgeStatusLabels[file.status]}
+                      </span>
                     </div>
                     <strong>{file.name}</strong>
                     <p>{file.relative_path}</p>
+                    {file.error ? <p className="knowledge-file-error">{file.error}</p> : null}
                   </div>
+                  {file.status === "failed" ? (
+                    <button
+                      type="button"
+                      className="browser-secondary-btn"
+                      onClick={() => void handleRetry(file)}
+                      disabled={retryingPath === file.relative_path}
+                    >
+                      {retryingPath === file.relative_path ? "重试中..." : "重试"}
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     className="knowledge-delete-btn"
@@ -333,6 +412,8 @@ export function KnowledgeManager() {
                 </div>
                 <div className="knowledge-file-meta">
                   <span>{formatDate(file.updated_at)}</span>
+                  <span>{file.chunk_count} chunks</span>
+                  <span>{file.indexed_at ? `indexed ${formatDate(file.indexed_at)}` : "等待索引时间"}</span>
                   <span>{selectedPaths.includes(file.relative_path) ? "已加入批量操作" : "单独可删除"}</span>
                 </div>
               </article>

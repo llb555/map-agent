@@ -1,20 +1,6 @@
+import { isChatStreamEventName } from "../generated/chatStreamContract";
 import type { ChatHistoryTurn, ChatStreamEnvelope, ChatStreamEventName } from "../types";
-
-export const STREAM_EVENT_NAMES: ChatStreamEventName[] = [
-  "session.started",
-  "subagent.changed",
-  "worker.started",
-  "worker.completed",
-  "worker.failed",
-  "assistant.token",
-  "tool.started",
-  "tool.progress",
-  "tool.completed",
-  "tool.failed",
-  "navigation.route_ready",
-  "assistant.completed",
-  "session.failed"
-];
+export { STREAM_EVENT_NAMES, isChatStreamEventName } from "../generated/chatStreamContract";
 
 const SUBAGENT_LABEL: Record<string, string> = {
   intent_router: "意图路由",
@@ -91,6 +77,29 @@ function readStreamTextField(data: Record<string, unknown>, keys: string[]): str
     }
   }
   return null;
+}
+
+export function parseChatStreamEnvelope(value: unknown): ChatStreamEnvelope | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const envelope = value as Record<string, unknown>;
+  if (typeof envelope.id !== "number") {
+    return null;
+  }
+  if (typeof envelope.session_id !== "string" || !envelope.session_id) {
+    return null;
+  }
+  if (typeof envelope.event !== "string" || !isChatStreamEventName(envelope.event)) {
+    return null;
+  }
+  if (typeof envelope.at !== "string" || !envelope.at) {
+    return null;
+  }
+  if (!envelope.data || typeof envelope.data !== "object") {
+    return null;
+  }
+  return envelope as ChatStreamEnvelope;
 }
 
 function getAssistantTokenPreview(data: Record<string, unknown>): string | null {

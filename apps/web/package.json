@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test:unit": "vitest run src/lib/chatLifecycle.test.ts",
     "test:e2e": "playwright test",
+    "test:e2e:golden": "playwright test tests/e2e/arcade-browser-map.spec.ts -g \"golden chain\"",
     "test:e2e:headed": "playwright test --headed"
   },
   "dependencies": {
@@ -22,8 +25,9 @@
     "@playwright/test": "^1.54.1",
     "@types/react": "^18.3.11",
     "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.3",
+    "@vitejs/plugin-react": "^6.0.3",
     "typescript": "^5.7.2",
-    "vite": "^5.4.10"
+    "vite": "^8.1.3",
+    "vitest": "^4.1.10"
   }
 }

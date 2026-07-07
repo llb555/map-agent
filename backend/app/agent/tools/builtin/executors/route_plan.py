@@ -29,4 +29,9 @@ async def execute(context: BuiltinToolContext, args: dict[str, Any]) -> dict[str
             origin=origin,
             destination=destination,
         )
-    return {"route": route.model_dump(mode="json")}
+    payload = route.model_dump(mode="json")
+    fallback_reason = payload.get("hint") if isinstance(payload.get("hint"), str) else None
+    result = {"route": payload}
+    if fallback_reason:
+        result["fallback_reason"] = fallback_reason
+    return result

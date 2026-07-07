@@ -8,12 +8,16 @@ import {
   listChatSessions
 } from "../api/client";
 import { resolveClientLocationForSessionStart, warmupClientLocationCache } from "../lib/clientLocation";
+import { canDispatchChat, chatLifecycleFromSessionStatus } from "../lib/chatLifecycle";
 import {
   getChatClientId,
+  readStoredStreamOffsets,
   readStoredActiveSessionId,
+  writeStoredStreamOffset,
   writeStoredActiveSessionId
 } from "../lib/chatSessionStorage";
-import { STREAM_EVENT_NAMES, toProgressText, toVisibleTurns } from "../lib/chatStream";
+import { parseChatStreamEnvelope, STREAM_EVENT_NAMES, toProgressText, toVisibleTurns } from "../lib/chatStream";
+import { mapArtifactsFromSessionDetail } from "../lib/mapArtifacts";
 import { useAppStore } from "../stores/appStore";
 import type {
   ChatMapArtifacts,
@@ -30,20 +34,8 @@ function makeSessionId(): string {
   return `s_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function hasSessionMapArtifacts(artifacts: ChatMapArtifacts): boolean {
-  return Boolean(artifacts.route || artifacts.destination || artifacts.shops.length || artifacts.view_payload);
-}
-
 function mapArtifactsFromSession(detail: ChatSessionDetail): ChatMapArtifacts | null {
-  const artifacts: ChatMapArtifacts = {
-    shops: detail.shops,
-    route: detail.route ?? null,
-    client_location: detail.client_location ?? null,
-    destination: detail.destination ?? null,
-    view_payload: detail.view_payload ?? null,
-    route_pending: false
-  };
-  return hasSessionMapArtifacts(artifacts) ? artifacts : null;
+  return mapArtifactsFromSessionDetail(detail);
 }
 
 function coerceStreamRoute(data: Record<string, unknown>): RouteSummary | null {
@@ -56,6 +48,7 @@ function coerceStreamRoute(data: Record<string, unknown>): RouteSummary | null {
     return null;
   }
   return {
+    schema_version: typeof data.schema_version === "number" ? data.schema_version : 1,
     provider,
     mode,
     distance_m: typeof data.distance_m === "number" ? data.distance_m : null,
@@ -72,9 +65,7 @@ function coerceStreamRoute(data: Record<string, unknown>): RouteSummary | null {
 
 export function useChatSessionController() {
   const turns = useAppStore((state) => state.turns);
-  const sending = useAppStore((state) => state.sending);
-  const streamConnected = useAppStore((state) => state.streamConnected);
-  const awaitingAssistant = useAppStore((state) => state.awaitingAssistant);
+  const chatLifecycle = useAppStore((state) => state.chatLifecycle);
 
   const {
     applyStreamToken,
@@ -89,6 +80,7 @@ export function useChatSessionController() {
 
   const streamRef = useRef<EventSource | null>(null);
   const clientIdRef = useRef("");
+  const streamOffsetsRef = useRef<Record<string, number>>(readStoredStreamOffsets());
   if (!clientIdRef.current) {
     clientIdRef.current = getChatClientId();
   }
@@ -98,26 +90,10 @@ export function useChatSessionController() {
       streamRef.current.close();
       streamRef.current = null;
     }
-    useAppStore.getState().setStreamConnected(false);
   }, []);
 
   useEffect(() => {
-    if (!awaitingAssistant) {
-      return;
-    }
-
-    const hasStreamReply = streamReplyDisplay.trim().length > 0;
-    const last = turns[turns.length - 1];
-    const hasAssistantTurn = last?.role === "assistant" && last.content.trim().length > 0;
-    const streamReplySettled = streamReplyDisplay === streamReplyTarget;
-
-    if (!sending && !streamConnected && streamReplySettled && (hasStreamReply || hasAssistantTurn)) {
-      useAppStore.getState().setAwaitingAssistant(false);
-    }
-  }, [awaitingAssistant, sending, streamConnected, streamReplyDisplay, streamReplyTarget, turns]);
-
-  useEffect(() => {
-    if (!awaitingAssistant || streamReplyTarget.trim()) {
+    if ((chatLifecycle !== "streaming" && chatLifecycle !== "reconnecting") || streamReplyTarget.trim()) {
       return;
     }
 
@@ -125,7 +101,7 @@ export function useChatSessionController() {
     if (last?.role === "assistant" && last.content.trim() && last.content.length > getStreamReplyTarget().length) {
       writeStreamReplyTarget(last.content);
     }
-  }, [awaitingAssistant, getStreamReplyTarget, streamReplyTarget, turns, writeStreamReplyTarget]);
+  }, [chatLifecycle, getStreamReplyTarget, streamReplyTarget, turns, writeStreamReplyTarget]);
 
   useEffect(() => {
     void loadSessionList(readStoredActiveSessionId() || undefined);
@@ -182,15 +158,29 @@ export function useChatSessionController() {
     });
   }
 
-  function startStream(sessionId: string): void {
+  function updateStreamOffset(sessionId: string, offset: number): void {
+    streamOffsetsRef.current[sessionId] = Math.max(streamOffsetsRef.current[sessionId] ?? 0, offset);
+    writeStoredStreamOffset(sessionId, streamOffsetsRef.current[sessionId]);
+  }
+
+  function makeIdempotencyKey(sessionId: string): string {
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      return `run_${sessionId}_${crypto.randomUUID().replace(/-/g, "")}`;
+    }
+    return `run_${sessionId}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  function startStream(sessionId: string, lastEventId?: number): void {
     stopStream();
     const store = useAppStore.getState();
     store.setStreamItems([]);
     store.setActiveSubagent(null);
     store.setActiveSessionStatus("running");
+    store.transitionChatLifecycle("stream.reconnect");
     resetStreamReply();
 
-    const source = new EventSource(buildChatStreamUrl(sessionId, undefined, clientIdRef.current));
+    const resumeOffset = typeof lastEventId === "number" ? lastEventId : streamOffsetsRef.current[sessionId];
+    const source = new EventSource(buildChatStreamUrl(sessionId, resumeOffset, clientIdRef.current));
     streamRef.current = source;
 
     const handleEvent = (raw: Event) => {
@@ -214,15 +204,13 @@ export function useChatSessionController() {
         return;
       }
 
-      const envelope = parsed as ChatStreamEnvelope;
-      if (typeof envelope.id !== "number" || typeof envelope.event !== "string") {
-        return;
-      }
-      if (typeof envelope.data !== "object" || envelope.data === null) {
+      const envelope = parseChatStreamEnvelope(parsed);
+      if (!envelope) {
         return;
       }
 
       const currentStore = useAppStore.getState();
+      updateStreamOffset(sessionId, envelope.id);
 
       if (envelope.event === "session.started") {
         currentStore.setActiveSessionStatus("running");
@@ -247,11 +235,13 @@ export function useChatSessionController() {
         const route = coerceStreamRoute(envelope.data);
         if (route) {
           currentStore.setActiveMapArtifacts((previous) => ({
+            schema_version: previous?.schema_version ?? 1,
+            scene: "agent_route",
             shops: previous?.shops ?? [],
             route,
             client_location: previous?.client_location ?? null,
             destination: previous?.destination ?? null,
-            view_payload: previous?.view_payload ?? { version: 1, scene: "agent_route" },
+            view_payload: previous?.view_payload ?? { schema_version: 1, scene: "agent_route" },
             route_pending: true
           }));
         }
@@ -259,6 +249,7 @@ export function useChatSessionController() {
 
       if (envelope.event === "assistant.completed") {
         currentStore.setActiveSessionStatus("completed");
+        currentStore.transitionChatLifecycle("stream.complete");
         const reply = envelope.data.reply;
         if (typeof reply === "string" && reply) {
           if (reply.length >= getStreamReplyTarget().length) {
@@ -270,6 +261,7 @@ export function useChatSessionController() {
 
       if (envelope.event === "session.failed") {
         currentStore.setActiveSessionStatus("failed");
+        currentStore.transitionChatLifecycle("stream.fail");
         const error = envelope.data.error;
         currentStore.setChatError(typeof error === "string" && error.trim() ? error : "会话执行失败");
       }
@@ -277,7 +269,6 @@ export function useChatSessionController() {
       pushStreamEnvelope(envelope);
 
       if (envelope.event === "assistant.completed" || envelope.event === "session.failed") {
-        currentStore.setAwaitingAssistant(false);
         stopStream();
         void loadSession(sessionId, {
           preserveStreamState: true,
@@ -292,15 +283,18 @@ export function useChatSessionController() {
         return;
       }
       const currentStore = useAppStore.getState();
-      currentStore.setStreamConnected(true);
       currentStore.setActiveSessionStatus("running");
+      currentStore.transitionChatLifecycle("stream.open");
     };
 
     source.onerror = () => {
       if (streamRef.current !== source) {
         return;
       }
-      useAppStore.getState().setStreamConnected(false);
+      const store = useAppStore.getState();
+      if (store.chatLifecycle === "streaming") {
+        store.transitionChatLifecycle("stream.reconnect");
+      }
       if (source.readyState === EventSource.CLOSED) {
         stopStream();
         void loadSession(sessionId, {
@@ -329,6 +323,7 @@ export function useChatSessionController() {
     store.setTurns(toVisibleTurns(detail.turns));
     store.setActiveSubagent(detail.active_subagent || null);
     store.setActiveSessionStatus(detail.status);
+    store.setChatLifecycle(chatLifecycleFromSessionStatus(detail.status));
     store.setActiveMapArtifacts(mapArtifactsFromSession(detail));
 
     if (!preserveStreamState) {
@@ -337,7 +332,7 @@ export function useChatSessionController() {
     }
 
     if (detail.reply && detail.reply.trim() && detail.reply.length > getStreamReplyTarget().length) {
-      if (detail.status === "running") {
+    if (detail.status === "running") {
         writeStreamReplyTarget(detail.reply);
       } else {
         syncStreamReply(detail.reply);
@@ -351,14 +346,12 @@ export function useChatSessionController() {
     }
 
     if (detail.status === "running") {
-      store.setAwaitingAssistant(true);
       if (reconnectStream) {
         startStream(sessionId);
       }
       return;
     }
 
-    store.setAwaitingAssistant(false);
     if (!preserveStreamState) {
       stopStream();
     }
@@ -388,7 +381,7 @@ export function useChatSessionController() {
           stopStream();
           latestStore.setStreamItems([]);
           resetStreamReply();
-          latestStore.setAwaitingAssistant(false);
+          latestStore.transitionChatLifecycle("history.idle");
         }
         return;
       }
@@ -478,7 +471,7 @@ export function useChatSessionController() {
     const message = currentState.inputValue.trim();
     const pendingFiles = currentState.pendingChatFiles;
     const pendingAttachments = currentState.pendingChatAttachments;
-    if ((!message && pendingFiles.length === 0) || currentState.sending || currentState.awaitingAssistant) {
+    if ((!message && pendingFiles.length === 0) || !canDispatchChat(currentState.chatLifecycle)) {
       return;
     }
 
@@ -486,9 +479,10 @@ export function useChatSessionController() {
     const previousSessionId = currentState.activeSessionId;
     const previousSessionStatus = currentState.activeSessionStatus;
     const sessionId = currentState.activeSessionId || makeSessionId();
+    const idempotencyKey = makeIdempotencyKey(sessionId);
     const optimisticCreatedAt = new Date().toISOString();
 
-    currentState.setSending(true);
+    currentState.transitionChatLifecycle("dispatch.start");
     currentState.setChatError("");
 
     try {
@@ -502,7 +496,6 @@ export function useChatSessionController() {
       writeStoredActiveSessionId(sessionId);
       store.setActiveSessionStatus("running");
       store.setActiveMapArtifacts(null);
-      store.setAwaitingAssistant(true);
       store.setTurns((previous) => [
         ...previous,
         {
@@ -516,6 +509,7 @@ export function useChatSessionController() {
       const payload = {
         session_id: sessionId,
         client_id: clientIdRef.current,
+        idempotency_key: idempotencyKey,
         message,
         location: location ?? undefined,
         page_size: 5,
@@ -528,6 +522,7 @@ export function useChatSessionController() {
       latestStore.setActiveSessionId(dispatched.session_id);
       writeStoredActiveSessionId(dispatched.session_id);
       latestStore.setActiveSessionStatus(dispatched.status);
+      latestStore.transitionChatLifecycle("stream.reconnect");
       startStream(dispatched.session_id);
       await loadSessionList(dispatched.session_id, { preserveStreamState: true });
     } catch (err) {
@@ -539,6 +534,7 @@ export function useChatSessionController() {
       store.setActiveSessionId(previousSessionId);
       writeStoredActiveSessionId(previousSessionId);
       store.setActiveSessionStatus(previousSessionStatus);
+      store.setChatLifecycle(chatLifecycleFromSessionStatus(previousSessionStatus));
       store.setTurns((previous) => {
         const next = [...previous];
         const last = next[next.length - 1];
@@ -551,10 +547,7 @@ export function useChatSessionController() {
       store.setActiveSubagent(null);
       store.setActiveMapArtifacts(null);
       resetStreamReply();
-      store.setAwaitingAssistant(false);
       stopStream();
-    } finally {
-      useAppStore.getState().setSending(false);
     }
   }
 
@@ -567,7 +560,7 @@ export function useChatSessionController() {
 
   async function removeSession(sessionId: string): Promise<void> {
     const currentState = useAppStore.getState();
-    if (currentState.deletingSessionId || currentState.sending) {
+    if (currentState.deletingSessionId || !canDispatchChat(currentState.chatLifecycle)) {
       return;
     }
 
@@ -624,9 +617,9 @@ export function useChatSessionController() {
     streamReplyTarget,
     streamReply: streamReplyDisplay,
     streamReplyActive:
-      sending ||
-      streamConnected ||
-      awaitingAssistant ||
+      chatLifecycle === "dispatching" ||
+      chatLifecycle === "streaming" ||
+      chatLifecycle === "reconnecting" ||
       streamReplyDisplay.length < streamReplyTarget.length
   };
 }

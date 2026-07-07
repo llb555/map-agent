@@ -22,6 +22,8 @@ from app.protocol.messages import (
     ChatResponse,
     ChatSessionDispatchDto,
     ChatSessionDetailDto,
+    MapArtifactDto,
+    MapViewPayloadDto,
     ChatSessionSummaryDto,
     ClientLocationContext,
     IntentType,
@@ -190,6 +192,7 @@ def _request_from_form(
     session_id: str | None,
     client_id: str | None,
     message: str | None,
+    idempotency_key: str | None,
     intent: str | None,
     shop_id: str | None,
     location: str | None,
@@ -210,6 +213,7 @@ def _request_from_form(
     return ChatRequest(
         session_id=session_id or None,
         client_id=client_id or None,
+        idempotency_key=idempotency_key or None,
         message=(message or "").strip(),
         intent=intent or None,
         shop_id=int(shop_id) if shop_id else None,
@@ -260,6 +264,43 @@ def _state_client_location(state: AgentSessionState) -> ClientLocationContext | 
         return None
 
 
+def _coerce_map_view_payload(raw: object, *, has_route: bool) -> MapViewPayloadDto | None:
+    fallback_scene = "agent_route" if has_route else "agent_candidates"
+    if isinstance(raw, dict):
+        payload = dict(raw)
+        if payload.get("scene") not in {"agent_route", "agent_candidates"}:
+            payload["scene"] = fallback_scene
+        try:
+            return MapViewPayloadDto.model_validate(payload)
+        except Exception:
+            return None
+    if has_route:
+        return MapViewPayloadDto(schema_version=1, scene="agent_route")
+    return None
+
+
+def _build_map_artifact(
+    *,
+    shops: list,
+    route: object,
+    client_location: ClientLocationContext | None,
+    destination: object,
+    view_payload: MapViewPayloadDto | None,
+) -> MapArtifactDto | None:
+    scene = view_payload.scene if view_payload is not None else ("agent_route" if route is not None else "agent_candidates")
+    if not shops and route is None and destination is None and view_payload is None:
+        return None
+    return MapArtifactDto(
+        schema_version=1,
+        scene=scene,
+        shops=shops,
+        route=route,
+        client_location=client_location,
+        destination=destination,
+        view_payload=view_payload,
+    )
+
+
 def _to_detail(state: AgentSessionState, *, container: AppContainer) -> ChatSessionDetailDto:
     raw_shops = _state_shop_rows(state)
     shops = container.arcade_payload_mapper.summaries_from_rows(raw_shops)
@@ -274,20 +315,34 @@ def _to_detail(state: AgentSessionState, *, container: AppContainer) -> ChatSess
         if isinstance(destination_raw, dict)
         else None
     )
+    client_location = _state_client_location(state)
+    view_payload = _coerce_map_view_payload(
+        get_working_memory_artifact(state.working_memory, "view_payload"),
+        has_route=route is not None,
+    )
+    map_artifact = _build_map_artifact(
+        shops=shops,
+        route=route,
+        client_location=client_location,
+        destination=destination,
+        view_payload=view_payload,
+    )
     return ChatSessionDetailDto(
         session_id=state.session_id,
         intent=_normalize_intent(state.intent),
         active_subagent=state.active_subagent,
         status=state.status,
+        run_status=state.run_status,
+        idempotency_key=state.idempotency_key,
+        last_stream_offset=state.last_stream_offset,
         last_error=state.last_error,
         reply=state.working_memory.get("reply") if isinstance(state.working_memory.get("reply"), str) else None,
         shops=shops,
         route=route,
-        client_location=_state_client_location(state),
+        client_location=client_location,
         destination=destination,
-        view_payload=get_working_memory_artifact(state.working_memory, "view_payload")
-        if isinstance(get_working_memory_artifact(state.working_memory, "view_payload"), dict)
-        else None,
+        view_payload=view_payload,
+        map_artifact=map_artifact,
         turn_count=len(state.turns),
         created_at=state.created_at,
         updated_at=state.updated_at,
@@ -326,6 +381,7 @@ async def chat(
 async def chat_with_upload(
     session_id: str | None = Form(default=None),
     client_id: str | None = Form(default=None),
+    idempotency_key: str | None = Form(default=None),
     message: str | None = Form(default=None),
     intent: str | None = Form(default=None),
     shop_id: str | None = Form(default=None),
@@ -342,6 +398,7 @@ async def chat_with_upload(
     request = _request_from_form(
         session_id=session_id,
         client_id=client_id,
+        idempotency_key=idempotency_key,
         message=message,
         intent=intent,
         shop_id=shop_id,
@@ -373,12 +430,21 @@ async def dispatch_chat_session(
         " ".join(request.message.split())[:160],
     )
     try:
-        session_id = await container.orchestrator.dispatch_chat(request)
+        dispatch = await container.orchestrator.dispatch_chat(request)
     except SessionAlreadyRunningError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except SessionOwnershipError as exc:
         raise HTTPException(status_code=404, detail=f"session '{exc.session_id}' not found") from exc
-    return ChatSessionDispatchDto(session_id=session_id, status="running")
+    snapshot = container.session_store.snapshot(dispatch.session_id, client_id=request.client_id)
+    status_value = snapshot.status if snapshot is not None else "running"
+    run_status_value = snapshot.run_status if snapshot is not None else "running"
+    return ChatSessionDispatchDto(
+        session_id=dispatch.session_id,
+        status=status_value,
+        run_status=run_status_value,
+        idempotency_key=dispatch.idempotency_key,
+        last_stream_offset=dispatch.last_stream_offset,
+    )
 
 
 @router.post(
@@ -389,6 +455,7 @@ async def dispatch_chat_session(
 async def dispatch_chat_session_with_upload(
     session_id: str | None = Form(default=None),
     client_id: str | None = Form(default=None),
+    idempotency_key: str | None = Form(default=None),
     message: str | None = Form(default=None),
     intent: str | None = Form(default=None),
     shop_id: str | None = Form(default=None),
@@ -405,6 +472,7 @@ async def dispatch_chat_session_with_upload(
     request = _request_from_form(
         session_id=session_id,
         client_id=client_id,
+        idempotency_key=idempotency_key,
         message=message,
         intent=intent,
         shop_id=shop_id,

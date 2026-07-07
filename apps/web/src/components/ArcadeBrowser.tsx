@@ -32,6 +32,8 @@ export function ArcadeBrowser() {
   const selectedRegionPoint = useArcadeBrowserStore((state) => state.selectedRegionPoint);
   const searchFallback = useArcadeBrowserStore((state) => state.searchFallback);
   const detailRequestIdRef = useRef(0);
+  const searchAbortRef = useRef<AbortController | null>(null);
+  const detailAbortRef = useRef<AbortController | null>(null);
   const setSelectedFallbackCandidate = useArcadeBrowserStore((state) => state.setSelectedFallbackCandidate);
 
   useEffect(() => {
@@ -199,7 +201,7 @@ export function ArcadeBrowser() {
     };
   }
 
-  async function resolveSearchFallback(shopName: string): Promise<void> {
+  async function resolveSearchFallback(shopName: string, signal?: AbortSignal): Promise<void> {
     const trimmed = shopName.trim();
     const store = useArcadeBrowserStore.getState();
     if (!trimmed) {
@@ -210,10 +212,13 @@ export function ArcadeBrowser() {
     let knowledgeHits: Awaited<ReturnType<typeof lookupKnowledge>>["hits"] = [];
     let knowledgeArcadeCandidates: Awaited<ReturnType<typeof lookupKnowledge>>["arcade_candidates"] = [];
     try {
-      const knowledge = await lookupKnowledge(trimmed, 3);
+      const knowledge = await lookupKnowledge(trimmed, 3, { signal });
       knowledgeHits = knowledge.hits ?? [];
       knowledgeArcadeCandidates = knowledge.arcade_candidates ?? [];
     } catch {
+      if (signal?.aborted) {
+        return;
+      }
       knowledgeHits = [];
       knowledgeArcadeCandidates = [];
     }
@@ -225,6 +230,9 @@ export function ArcadeBrowser() {
     let candidates: SearchFallbackCandidate[] = [...structuredCandidates];
     if (mapRuntime?.AMap) {
       const geocodeCandidates = await geocodeAddressCandidatesToGcj02(mapRuntime.AMap, trimmed, clientLocation?.city || undefined);
+      if (signal?.aborted) {
+        return;
+      }
       const mappedGeocodeCandidates = geocodeCandidates.map((item) => ({
         ...item,
         source: "geocode" as const
@@ -256,16 +264,22 @@ export function ArcadeBrowser() {
 
   const loadDetailForItem = useCallback(async (item: ArcadeSummary) => {
     const requestId = ++detailRequestIdRef.current;
+    detailAbortRef.current?.abort();
+    const controller = new AbortController();
+    detailAbortRef.current = controller;
     const store = useArcadeBrowserStore.getState();
     store.setDetailLoading(true);
     store.setDetailError("");
     try {
-      const payload = await getArcadeDetail(item.source_id);
+      const payload = await getArcadeDetail(item.source_id, { signal: controller.signal });
       if (requestId !== detailRequestIdRef.current) {
         return;
       }
       useArcadeBrowserStore.getState().setDetail(payload);
     } catch (err) {
+      if (controller.signal.aborted) {
+        return;
+      }
       if (requestId !== detailRequestIdRef.current) {
         return;
       }
@@ -275,6 +289,9 @@ export function ArcadeBrowser() {
     } finally {
       if (requestId === detailRequestIdRef.current) {
         useArcadeBrowserStore.getState().setDetailLoading(false);
+      }
+      if (detailAbortRef.current === controller) {
+        detailAbortRef.current = null;
       }
     }
   }, []);
@@ -288,6 +305,9 @@ export function ArcadeBrowser() {
   }, [detail?.source_id, detailError, loadDetailForItem]);
 
   async function runSearch(page = 1): Promise<void> {
+    searchAbortRef.current?.abort();
+    const controller = new AbortController();
+    searchAbortRef.current = controller;
     const state = useArcadeBrowserStore.getState();
     state.setLoading(true);
     state.setError("");
@@ -311,7 +331,10 @@ export function ArcadeBrowser() {
         origin_coord_system: state.sortBy === "distance" ? "wgs84" : undefined,
         page,
         page_size: PAGE_SIZE
-      });
+      }, { signal: controller.signal });
+      if (controller.signal.aborted) {
+        return;
+      }
       const latestStore = useArcadeBrowserStore.getState();
       latestStore.setPaged(payload);
 
@@ -331,7 +354,9 @@ export function ArcadeBrowser() {
         latestStore.setDetailLoading(false);
         latestStore.setSelectedRegionPoint(null);
         latestStore.setMapStatus("idle");
-        await resolveSearchFallback(state.shopName);
+        if (!controller.signal.aborted) {
+          await resolveSearchFallback(state.shopName, controller.signal);
+        }
         return;
       }
       latestStore.setSelectedSourceId(existing.source_id);
@@ -340,14 +365,24 @@ export function ArcadeBrowser() {
         await loadDetailForItem(existing);
       }
     } catch (err) {
+      if (controller.signal.aborted) {
+        return;
+      }
       useArcadeBrowserStore.getState().setError(err instanceof Error ? err.message : "检索机厅失败");
     } finally {
-      useArcadeBrowserStore.getState().setLoading(false);
+      if (searchAbortRef.current === controller) {
+        searchAbortRef.current = null;
+        useArcadeBrowserStore.getState().setLoading(false);
+      }
     }
   }
 
   useEffect(() => {
     void runSearch(1);
+    return () => {
+      searchAbortRef.current?.abort();
+      detailAbortRef.current?.abort();
+    };
   }, []);
 
   async function onSubmit(event: FormEvent): Promise<void> {

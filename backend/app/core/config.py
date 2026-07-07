@@ -86,6 +86,7 @@ class Settings:
     supabase_service_role_key: str = ""
     supabase_timeout_seconds: float = 8.0
     chat_session_store_path: Path = Path("data/runtime/chat_sessions.json")
+    chat_stream_event_store_path: Path = Path("data/runtime/chat_stream_events.jsonl")
     replay_buffer_size: int = 200
     sse_keepalive_seconds: float = 1.0
     sse_max_wait_seconds: int = 20
@@ -174,6 +175,9 @@ class Settings:
             ),
             chat_session_store_path=_resolve_project_path(
                 os.getenv("CHAT_SESSION_STORE_PATH", str(cls.chat_session_store_path))
+            ),
+            chat_stream_event_store_path=_resolve_project_path(
+                os.getenv("CHAT_STREAM_EVENT_STORE_PATH", str(cls.chat_stream_event_store_path))
             ),
             replay_buffer_size=int(os.getenv("REPLAY_BUFFER_SIZE", str(cls.replay_buffer_size))),
             sse_keepalive_seconds=float(

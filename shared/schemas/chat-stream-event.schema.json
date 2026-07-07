@@ -1,0 +1,894 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arcadegent.local/schemas/chat-stream-event.schema.json",
+  "title": "Arcadegent Chat Stream SSE Event",
+  "$defs": {
+    "StreamEvent": {
+      "description": "Single stream event persisted in memory for SSE replay.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "integer"
+        },
+        "session_id": {
+          "title": "Session Id",
+          "type": "string"
+        },
+        "event": {
+          "enum": [
+            "session.started",
+            "subagent.changed",
+            "worker.started",
+            "worker.completed",
+            "worker.failed",
+            "assistant.token",
+            "tool.started",
+            "tool.progress",
+            "tool.completed",
+            "tool.failed",
+            "navigation.route_ready",
+            "assistant.completed",
+            "session.failed"
+          ],
+          "title": "Event",
+          "type": "string"
+        },
+        "at": {
+          "title": "At",
+          "type": "string"
+        },
+        "data": {
+          "additionalProperties": true,
+          "title": "Data",
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "session_id",
+        "event"
+      ],
+      "title": "StreamEvent",
+      "type": "object"
+    },
+    "eventData": {
+      "session.started": {
+        "additionalProperties": true,
+        "properties": {
+          "intent": {
+            "enum": [
+              "search_nearby",
+              "navigate",
+              "search"
+            ],
+            "title": "Intent",
+            "type": "string"
+          },
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Model"
+          }
+        },
+        "required": [
+          "intent",
+          "active_subagent"
+        ],
+        "title": "SessionStartedData",
+        "type": "object"
+      },
+      "subagent.changed": {
+        "additionalProperties": true,
+        "properties": {
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          },
+          "to_subagent": {
+            "title": "To Subagent",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reason"
+          },
+          "from_subagent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "From Subagent"
+          },
+          "worker_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Worker Run Id"
+          }
+        },
+        "required": [
+          "active_subagent",
+          "to_subagent"
+        ],
+        "title": "SubagentChangedData",
+        "type": "object"
+      },
+      "worker.started": {
+        "additionalProperties": true,
+        "properties": {
+          "worker": {
+            "title": "Worker",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          },
+          "task_preview": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Task Preview"
+          }
+        },
+        "required": [
+          "worker",
+          "run_id",
+          "active_subagent"
+        ],
+        "title": "WorkerStartedData",
+        "type": "object"
+      },
+      "worker.completed": {
+        "additionalProperties": true,
+        "properties": {
+          "worker": {
+            "title": "Worker",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Status"
+          },
+          "summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Summary"
+          }
+        },
+        "required": [
+          "worker",
+          "run_id",
+          "active_subagent"
+        ],
+        "title": "WorkerCompletedData",
+        "type": "object"
+      },
+      "worker.failed": {
+        "additionalProperties": true,
+        "properties": {
+          "worker": {
+            "title": "Worker",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          }
+        },
+        "required": [
+          "worker",
+          "run_id",
+          "error",
+          "active_subagent"
+        ],
+        "title": "WorkerFailedData",
+        "type": "object"
+      },
+      "assistant.token": {
+        "additionalProperties": true,
+        "properties": {
+          "delta": {
+            "title": "Delta",
+            "type": "string"
+          },
+          "content": {
+            "title": "Content",
+            "type": "string"
+          },
+          "index": {
+            "title": "Index",
+            "type": "integer"
+          },
+          "total": {
+            "title": "Total",
+            "type": "integer"
+          },
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          },
+          "text_preview": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Text Preview"
+          }
+        },
+        "required": [
+          "delta",
+          "content",
+          "index",
+          "total",
+          "active_subagent"
+        ],
+        "title": "AssistantTokenData",
+        "type": "object"
+      },
+      "tool.started": {
+        "additionalProperties": true,
+        "properties": {
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          },
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          },
+          "worker_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Worker Run Id"
+          }
+        },
+        "required": [
+          "tool",
+          "call_id",
+          "active_subagent"
+        ],
+        "title": "ToolEventData",
+        "type": "object"
+      },
+      "tool.progress": {
+        "additionalProperties": true,
+        "properties": {
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          },
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          },
+          "worker_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Worker Run Id"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Message"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Progress"
+          }
+        },
+        "required": [
+          "tool",
+          "call_id",
+          "active_subagent"
+        ],
+        "title": "ToolProgressData",
+        "type": "object"
+      },
+      "tool.completed": {
+        "additionalProperties": true,
+        "properties": {
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          },
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          },
+          "worker_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Worker Run Id"
+          },
+          "distance_m": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Distance M"
+          }
+        },
+        "required": [
+          "tool",
+          "call_id",
+          "active_subagent"
+        ],
+        "title": "ToolCompletedData",
+        "type": "object"
+      },
+      "tool.failed": {
+        "additionalProperties": true,
+        "properties": {
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          },
+          "call_id": {
+            "title": "Call Id",
+            "type": "string"
+          },
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          },
+          "worker_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Worker Run Id"
+          },
+          "error": {
+            "title": "Error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool",
+          "call_id",
+          "active_subagent",
+          "error"
+        ],
+        "title": "ToolFailedData",
+        "type": "object"
+      },
+      "navigation.route_ready": {
+        "$defs": {
+          "GeoPoint": {
+            "description": "Public geo payload with explicit coordinate-system semantics.",
+            "properties": {
+              "lng": {
+                "title": "Lng",
+                "type": "number"
+              },
+              "lat": {
+                "title": "Lat",
+                "type": "number"
+              },
+              "coord_system": {
+                "default": "gcj02",
+                "enum": [
+                  "gcj02",
+                  "wgs84"
+                ],
+                "title": "Coord System",
+                "type": "string"
+              },
+              "source": {
+                "default": "route",
+                "enum": [
+                  "catalog",
+                  "geocode",
+                  "client",
+                  "route"
+                ],
+                "title": "Source",
+                "type": "string"
+              },
+              "precision": {
+                "default": "approx",
+                "enum": [
+                  "exact",
+                  "approx"
+                ],
+                "title": "Precision",
+                "type": "string"
+              }
+            },
+            "required": [
+              "lng",
+              "lat"
+            ],
+            "title": "GeoPoint",
+            "type": "object"
+          }
+        },
+        "additionalProperties": true,
+        "properties": {
+          "schema_version": {
+            "default": 1,
+            "title": "Schema Version",
+            "type": "integer"
+          },
+          "provider": {
+            "enum": [
+              "amap",
+              "google",
+              "none"
+            ],
+            "title": "Provider",
+            "type": "string"
+          },
+          "mode": {
+            "title": "Mode",
+            "type": "string"
+          },
+          "distance_m": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Distance M"
+          },
+          "duration_s": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Duration S"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/GeoPoint"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "destination": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/GeoPoint"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "polyline": {
+            "items": {
+              "$ref": "#/$defs/GeoPoint"
+            },
+            "title": "Polyline",
+            "type": "array"
+          },
+          "hint": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Hint"
+          }
+        },
+        "required": [
+          "provider",
+          "mode"
+        ],
+        "title": "NavigationRouteReadyData",
+        "type": "object"
+      },
+      "assistant.completed": {
+        "additionalProperties": true,
+        "properties": {
+          "reply": {
+            "title": "Reply",
+            "type": "string"
+          },
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reply",
+          "active_subagent"
+        ],
+        "title": "AssistantCompletedData",
+        "type": "object"
+      },
+      "session.failed": {
+        "additionalProperties": true,
+        "properties": {
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "active_subagent": {
+            "title": "Active Subagent",
+            "type": "string"
+          }
+        },
+        "required": [
+          "error",
+          "active_subagent"
+        ],
+        "title": "SessionFailedData",
+        "type": "object"
+      }
+    },
+    "GeoPoint": {
+      "description": "Public geo payload with explicit coordinate-system semantics.",
+      "properties": {
+        "lng": {
+          "title": "Lng",
+          "type": "number"
+        },
+        "lat": {
+          "title": "Lat",
+          "type": "number"
+        },
+        "coord_system": {
+          "default": "gcj02",
+          "enum": [
+            "gcj02",
+            "wgs84"
+          ],
+          "title": "Coord System",
+          "type": "string"
+        },
+        "source": {
+          "default": "route",
+          "enum": [
+            "catalog",
+            "geocode",
+            "client",
+            "route"
+          ],
+          "title": "Source",
+          "type": "string"
+        },
+        "precision": {
+          "default": "approx",
+          "enum": [
+            "exact",
+            "approx"
+          ],
+          "title": "Precision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "lng",
+        "lat"
+      ],
+      "title": "GeoPoint",
+      "type": "object"
+    }
+  },
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "integer"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "event": {
+      "enum": [
+        "session.started",
+        "subagent.changed",
+        "worker.started",
+        "worker.completed",
+        "worker.failed",
+        "assistant.token",
+        "tool.started",
+        "tool.progress",
+        "tool.completed",
+        "tool.failed",
+        "navigation.route_ready",
+        "assistant.completed",
+        "session.failed"
+      ],
+      "type": "string"
+    },
+    "at": {
+      "type": "string"
+    },
+    "data": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "id",
+    "session_id",
+    "event",
+    "at",
+    "data"
+  ],
+  "oneOf": [
+    {
+      "properties": {
+        "event": {
+          "const": "session.started"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/session.started"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "subagent.changed"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/subagent.changed"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "worker.started"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/worker.started"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "worker.completed"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/worker.completed"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "worker.failed"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/worker.failed"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "assistant.token"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/assistant.token"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "tool.started"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/tool.started"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "tool.progress"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/tool.progress"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "tool.completed"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/tool.completed"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "tool.failed"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/tool.failed"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "navigation.route_ready"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/navigation.route_ready"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "assistant.completed"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/assistant.completed"
+        }
+      }
+    },
+    {
+      "properties": {
+        "event": {
+          "const": "session.failed"
+        },
+        "data": {
+          "$ref": "#/$defs/eventData/session.failed"
+        }
+      }
+    }
+  ]
+}

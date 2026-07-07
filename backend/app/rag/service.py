@@ -7,15 +7,17 @@ import math
 import shutil
 import subprocess
 import time
+import uuid
+from collections import Counter
+from collections import OrderedDict
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Lock
+from threading import Condition, RLock, Thread
 from typing import Any
 import hashlib
 import re
-from collections import Counter
-from collections import OrderedDict
 from xml.etree import ElementTree
 from zipfile import BadZipFile, ZipFile
 
@@ -43,6 +45,49 @@ class _SimpleDocument:
 
     page_content: str
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _SourceFileSnapshot:
+    """Stable source-file identity used for incremental indexing decisions."""
+
+    name: str
+    relative_path: str
+    suffix: str
+    size_bytes: int
+    updated_at: float
+    content_hash: str
+
+
+@dataclass
+class _KnowledgeFileState:
+    """Persisted per-file indexing state exposed to the management UI."""
+
+    name: str
+    relative_path: str
+    suffix: str
+    size_bytes: int
+    updated_at: float
+    content_hash: str | None = None
+    status: str = "pending"
+    chunk_count: int = 0
+    indexed_at: float | None = None
+    error: str | None = None
+    job_id: str | None = None
+
+
+@dataclass
+class _IndexJob:
+    """One background indexing queue item."""
+
+    job_id: str
+    kind: str
+    relative_paths: list[str] | None
+    status: str = "pending"
+    enqueued_at: float = 0.0
+    started_at: float | None = None
+    finished_at: float | None = None
+    error: str | None = None
 
 
 class OpenAICompatibleEmbeddings:
@@ -419,9 +464,14 @@ class LangChainRAGService:
         self._snapshot_path = settings.rag_snapshot_path
         self._bm25_index: BM25Index | None = BM25Index() if self._hybrid_search_enabled else None
 
-        self._lock = Lock()
+        self._lock = RLock()
+        self._job_condition = Condition()
+        self._job_queue: deque[_IndexJob] = deque()
+        self._jobs: OrderedDict[str, _IndexJob] = OrderedDict()
+        self._job_worker: Thread | None = None
         self._index_ready = False
         self._chunk_records: list[_ChunkRecord] = []
+        self._file_states: dict[str, _KnowledgeFileState] = {}
         self._load_error: str | None = None
         self._faiss_index: Any | None = None
         self._supported_suffixes = {".md", ".txt", ".json", ".jsonl", ".pdf", ".docx", ".doc"}
@@ -431,6 +481,12 @@ class LangChainRAGService:
         self._rag_embedding_model_signature = settings.rag_embedding_model.strip()
 
     def health(self) -> dict[str, Any]:
+        file_states = list(self._merged_file_states().values())
+        pending_count = sum(1 for item in file_states if item.status == "pending")
+        indexing_count = sum(1 for item in file_states if item.status == "indexing")
+        ready_count = sum(1 for item in file_states if item.status == "ready")
+        failed_count = sum(1 for item in file_states if item.status == "failed")
+        active_job = self._active_job()
         return {
             "enabled": self._enabled,
             "source_path": str(self._source_path),
@@ -450,19 +506,37 @@ class LangChainRAGService:
             "query_cache_hits": self._query_cache_hits,
             "query_cache_misses": self._query_cache_misses,
             "query_cache_hit_rate": self._query_cache_hit_rate(),
-            "index_ready": self._index_ready,
+            "index_ready": self._index_ready and pending_count == 0 and indexing_count == 0 and failed_count == 0,
             "chunk_count": len(self._chunk_records),
             "load_error": self._load_error,
+            "pending_count": pending_count,
+            "indexing_count": indexing_count,
+            "ready_count": ready_count,
+            "failed_count": failed_count,
+            "job_count": len(self._jobs),
+            "active_job_id": active_job.job_id if active_job is not None else None,
         }
 
     def rebuild_index(self) -> dict[str, Any]:
-        with self._lock:
-            self._index_ready = False
-            self._chunk_records = []
-            self._load_error = None
-            self._faiss_index = None
-        self._ensure_index_loaded()
+        self._apply_incremental_index_update(force=True, job_id=None)
         return self.health()
+
+    def enqueue_reindex(
+        self,
+        *,
+        relative_paths: list[str] | None = None,
+        kind: str = "reindex",
+    ) -> dict[str, Any]:
+        job = self._enqueue_index_job(kind=kind, relative_paths=relative_paths)
+        return {**self.health(), "queued_job_id": job.job_id}
+
+    def retry_failed_file(self, relative_path: str) -> dict[str, Any]:
+        state = self._merged_file_states().get(relative_path)
+        if state is None:
+            raise RuntimeError("knowledge_file_not_found")
+        if state.status != "failed":
+            raise RuntimeError("knowledge_file_not_failed")
+        return self.enqueue_reindex(relative_paths=[relative_path], kind="retry")
 
     def warmup(self) -> dict[str, Any]:
         if not self._enabled:
@@ -471,7 +545,7 @@ class LangChainRAGService:
             self._load_error = "rag_embeddings_not_configured"
             return self.health()
         try:
-            self._ensure_index_loaded()
+            self._apply_incremental_index_update(force=False, job_id=None)
         except Exception as exc:
             self._load_error = str(exc).strip() or type(exc).__name__
         return self.health()
@@ -483,31 +557,503 @@ class LangChainRAGService:
         return sorted(self._supported_suffixes)
 
     def list_source_files(self) -> list[dict[str, Any]]:
-        if not self._source_path.exists():
+        return [
+            self._file_state_to_public_dict(state)
+            for state in sorted(self._merged_file_states().values(), key=lambda item: item.relative_path)
+        ]
+
+    def _enqueue_index_job(self, *, kind: str, relative_paths: list[str] | None) -> _IndexJob:
+        normalized_paths = self._normalize_relative_paths(relative_paths) if relative_paths is not None else None
+        job = _IndexJob(
+            job_id=uuid.uuid4().hex,
+            kind=kind,
+            relative_paths=normalized_paths,
+            enqueued_at=time.time(),
+        )
+        self._mark_paths_pending(normalized_paths, job_id=job.job_id)
+        with self._job_condition:
+            self._jobs[job.job_id] = job
+            self._job_queue.append(job)
+            while len(self._jobs) > 80:
+                old_job_id, old_job = next(iter(self._jobs.items()))
+                if old_job.status in {"pending", "indexing"}:
+                    break
+                self._jobs.pop(old_job_id, None)
+            self._ensure_job_worker_locked()
+            self._job_condition.notify()
+        return job
+
+    def _ensure_job_worker_locked(self) -> None:
+        if self._job_worker is not None and self._job_worker.is_alive():
+            return
+        self._job_worker = Thread(
+            target=self._job_worker_loop,
+            name="rag-index-worker",
+            daemon=True,
+        )
+        self._job_worker.start()
+
+    def _job_worker_loop(self) -> None:
+        while True:
+            with self._job_condition:
+                while not self._job_queue:
+                    self._job_condition.wait()
+                job = self._job_queue.popleft()
+                job.status = "indexing"
+                job.started_at = time.time()
+            try:
+                self._apply_incremental_index_update(
+                    target_relative_paths=job.relative_paths,
+                    force=job.kind == "full_reindex",
+                    job_id=job.job_id,
+                )
+                job.status = "ready"
+                job.error = None
+            except Exception as exc:  # pragma: no cover - worker failures are reflected in status payloads
+                message = str(exc).strip() or type(exc).__name__
+                job.status = "failed"
+                job.error = message
+                with self._lock:
+                    self._load_error = message
+            finally:
+                job.finished_at = time.time()
+                with self._job_condition:
+                    self._job_condition.notify_all()
+
+    def _active_job(self) -> _IndexJob | None:
+        with self._job_condition:
+            for job in reversed(self._jobs.values()):
+                if job.status in {"pending", "indexing"}:
+                    return job
+        return None
+
+    def _mark_paths_pending(self, relative_paths: list[str] | None, *, job_id: str) -> None:
+        snapshots = self._current_source_snapshots()
+        target_paths = set(relative_paths) if relative_paths is not None else set(snapshots.keys())
+        with self._lock:
+            for relative_path, snapshot in snapshots.items():
+                if relative_path not in target_paths:
+                    continue
+                previous = self._file_states.get(relative_path)
+                self._file_states[relative_path] = _KnowledgeFileState(
+                    name=snapshot.name,
+                    relative_path=snapshot.relative_path,
+                    suffix=snapshot.suffix,
+                    size_bytes=snapshot.size_bytes,
+                    updated_at=snapshot.updated_at,
+                    content_hash=snapshot.content_hash,
+                    status="pending",
+                    chunk_count=previous.chunk_count if previous is not None else 0,
+                    indexed_at=previous.indexed_at if previous is not None else None,
+                    error=None,
+                    job_id=job_id,
+                )
+
+    def _normalize_relative_paths(self, relative_paths: list[str] | None) -> list[str]:
+        if not relative_paths:
             return []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in relative_paths:
+            path = Path(str(item).strip())
+            if not path.as_posix() or path.is_absolute() or ".." in path.parts:
+                continue
+            value = path.as_posix()
+            if value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+        return normalized
+
+    def _merged_file_states(self) -> dict[str, _KnowledgeFileState]:
+        snapshots = self._current_source_snapshots()
+        chunk_counts = self._chunk_counts_by_file()
+        with self._lock:
+            existing_states = dict(self._file_states)
+        merged: dict[str, _KnowledgeFileState] = {}
+        for relative_path, snapshot in snapshots.items():
+            previous = existing_states.get(relative_path)
+            if previous is not None:
+                status = previous.status
+                error = previous.error
+                indexed_at = previous.indexed_at
+                job_id = previous.job_id
+            else:
+                status = "ready" if self._index_ready else "pending"
+                error = None
+                indexed_at = None
+                job_id = None
+            if previous is not None and previous.content_hash and previous.content_hash != snapshot.content_hash:
+                status = "pending"
+            merged[relative_path] = _KnowledgeFileState(
+                name=snapshot.name,
+                relative_path=snapshot.relative_path,
+                suffix=snapshot.suffix,
+                size_bytes=snapshot.size_bytes,
+                updated_at=snapshot.updated_at,
+                content_hash=snapshot.content_hash,
+                status=status,
+                chunk_count=chunk_counts.get(relative_path, previous.chunk_count if previous is not None else 0),
+                indexed_at=indexed_at,
+                error=error,
+                job_id=job_id,
+            )
+        return merged
+
+    def _current_source_snapshots(self) -> dict[str, _SourceFileSnapshot]:
+        if not self._source_path.exists():
+            return {}
         if self._source_path.is_file():
             paths = [self._source_path]
+            root = self._source_path.parent
         else:
+            root = self._source_path
             paths = sorted(
                 path
                 for path in self._source_path.rglob("*")
                 if path.is_file() and path.suffix.lower() in self._supported_suffixes
             )
-        results: list[dict[str, Any]] = []
+        snapshots: dict[str, _SourceFileSnapshot] = {}
         for path in paths:
-            stat = path.stat()
-            results.append(
+            try:
+                stat = path.stat()
+                content_hash = self._file_content_hash(path)
+            except OSError:
+                continue
+            relative_path = path.relative_to(root).as_posix() if self._source_path.is_dir() else path.name
+            snapshots[relative_path] = _SourceFileSnapshot(
+                name=path.name,
+                relative_path=relative_path,
+                suffix=path.suffix.lower(),
+                size_bytes=stat.st_size,
+                updated_at=stat.st_mtime,
+                content_hash=content_hash,
+            )
+        return snapshots
+
+    def _file_state_to_public_dict(self, state: _KnowledgeFileState) -> dict[str, Any]:
+        return {
+            "name": state.name,
+            "relative_path": state.relative_path,
+            "suffix": state.suffix,
+            "size_bytes": state.size_bytes,
+            "updated_at": state.updated_at,
+            "status": state.status,
+            "chunk_count": state.chunk_count,
+            "content_hash": state.content_hash,
+            "indexed_at": state.indexed_at,
+            "error": state.error,
+            "job_id": state.job_id,
+        }
+
+    def _file_content_hash(self, path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _chunk_counts_by_file(self) -> dict[str, int]:
+        counts: Counter[str] = Counter()
+        with self._lock:
+            records = list(self._chunk_records)
+        for record in records:
+            relative_path = self._record_relative_path(record)
+            if relative_path:
+                counts[relative_path] += 1
+        return dict(counts)
+
+    def _apply_incremental_index_update(
+        self,
+        *,
+        target_relative_paths: list[str] | None = None,
+        force: bool = False,
+        job_id: str | None = None,
+    ) -> None:
+        if not self._enabled:
+            return
+        if not self._embedder.enabled:
+            self._load_error = "rag_embeddings_not_configured"
+            self._mark_targets_failed(target_relative_paths, error=self._load_error, job_id=job_id)
+            return
+
+        self._restore_snapshot_for_incremental()
+        snapshots = self._current_source_snapshots()
+        with self._lock:
+            existing_records = list(self._chunk_records)
+            existing_states = dict(self._file_states)
+
+        current_paths = set(snapshots.keys())
+        record_paths = {path for path in (self._record_relative_path(record) for record in existing_records) if path}
+        state_paths = set(existing_states.keys())
+        if target_relative_paths is None:
+            target_paths = current_paths | record_paths | state_paths
+        else:
+            target_paths = set(self._normalize_relative_paths(target_relative_paths)) | (state_paths - current_paths)
+
+        existing_by_file: dict[str, list[_ChunkRecord]] = {}
+        for record in existing_records:
+            relative_path = self._record_relative_path(record)
+            if relative_path:
+                existing_by_file.setdefault(relative_path, []).append(record)
+
+        rebuilt_by_file: dict[str, list[_ChunkRecord]] = {
+            relative_path: list(records)
+            for relative_path, records in existing_by_file.items()
+            if relative_path in current_paths and relative_path not in target_paths
+        }
+        next_states: dict[str, _KnowledgeFileState] = {
+            relative_path: state
+            for relative_path, state in existing_states.items()
+            if relative_path in current_paths and relative_path not in target_paths
+        }
+        failed_any = False
+        last_failure: str | None = None
+
+        for relative_path in sorted(target_paths):
+            snapshot = snapshots.get(relative_path)
+            if snapshot is None:
+                rebuilt_by_file.pop(relative_path, None)
+                next_states.pop(relative_path, None)
+                continue
+
+            previous_state = existing_states.get(relative_path)
+            previous_records = existing_by_file.get(relative_path, [])
+            unchanged = (
+                not force
+                and previous_state is not None
+                and previous_state.status == "ready"
+                and previous_state.content_hash == snapshot.content_hash
+                and bool(previous_records) == (previous_state.chunk_count > 0)
+            )
+            if unchanged:
+                rebuilt_by_file[relative_path] = previous_records
+                next_states[relative_path] = _KnowledgeFileState(
+                    name=snapshot.name,
+                    relative_path=snapshot.relative_path,
+                    suffix=snapshot.suffix,
+                    size_bytes=snapshot.size_bytes,
+                    updated_at=snapshot.updated_at,
+                    content_hash=snapshot.content_hash,
+                    status="ready",
+                    chunk_count=len(previous_records),
+                    indexed_at=previous_state.indexed_at,
+                    error=None,
+                    job_id=previous_state.job_id,
+                )
+                continue
+
+            self._set_file_state(
+                snapshot,
+                status="indexing",
+                chunk_count=len(previous_records),
+                indexed_at=previous_state.indexed_at if previous_state is not None else None,
+                error=None,
+                job_id=job_id,
+            )
+            try:
+                records = self._records_for_file(
+                    snapshot=snapshot,
+                    previous_records=previous_records,
+                )
+            except Exception as exc:
+                failed_any = True
+                message = str(exc).strip() or type(exc).__name__
+                last_failure = message
+                rebuilt_by_file[relative_path] = previous_records
+                next_states[relative_path] = _KnowledgeFileState(
+                    name=snapshot.name,
+                    relative_path=snapshot.relative_path,
+                    suffix=snapshot.suffix,
+                    size_bytes=snapshot.size_bytes,
+                    updated_at=snapshot.updated_at,
+                    content_hash=snapshot.content_hash,
+                    status="failed",
+                    chunk_count=len(previous_records),
+                    indexed_at=previous_state.indexed_at if previous_state is not None else None,
+                    error=message,
+                    job_id=job_id,
+                )
+                continue
+
+            rebuilt_by_file[relative_path] = records
+            next_states[relative_path] = _KnowledgeFileState(
+                name=snapshot.name,
+                relative_path=snapshot.relative_path,
+                suffix=snapshot.suffix,
+                size_bytes=snapshot.size_bytes,
+                updated_at=snapshot.updated_at,
+                content_hash=snapshot.content_hash,
+                status="ready",
+                chunk_count=len(records),
+                indexed_at=time.time(),
+                error=None,
+                job_id=job_id,
+            )
+
+        records = [
+            record
+            for relative_path in sorted(rebuilt_by_file)
+            for record in sorted(
+                rebuilt_by_file[relative_path],
+                key=lambda item: int(item.metadata.get("knowledge_chunk_index") or 0),
+            )
+        ]
+        with self._lock:
+            self._chunk_records = records
+            self._file_states = next_states
+            self._refresh_vector_backend(records)
+            self._persist_generic_snapshot(records)
+            if self._hybrid_search_enabled and self._bm25_index is not None:
+                self._bm25_index.build([record.text for record in records])
+            self._index_ready = True
+            self._load_error = last_failure if failed_any else None
+            self._clear_query_cache()
+
+    def _restore_snapshot_for_incremental(self) -> None:
+        with self._lock:
+            already_loaded = self._index_ready or bool(self._chunk_records)
+        if already_loaded:
+            return
+        try:
+            if self._vector_backend == "faiss" and self._try_restore_faiss_snapshot(strict_source_signature=False):
+                return
+            self._try_restore_generic_snapshot(strict_source_signature=False)
+        except Exception:
+            return
+
+    def _set_file_state(
+        self,
+        snapshot: _SourceFileSnapshot,
+        *,
+        status: str,
+        chunk_count: int,
+        indexed_at: float | None,
+        error: str | None,
+        job_id: str | None,
+    ) -> None:
+        with self._lock:
+            self._file_states[snapshot.relative_path] = _KnowledgeFileState(
+                name=snapshot.name,
+                relative_path=snapshot.relative_path,
+                suffix=snapshot.suffix,
+                size_bytes=snapshot.size_bytes,
+                updated_at=snapshot.updated_at,
+                content_hash=snapshot.content_hash,
+                status=status,
+                chunk_count=chunk_count,
+                indexed_at=indexed_at,
+                error=error,
+                job_id=job_id,
+            )
+
+    def _mark_targets_failed(
+        self,
+        relative_paths: list[str] | None,
+        *,
+        error: str,
+        job_id: str | None,
+    ) -> None:
+        snapshots = self._current_source_snapshots()
+        target_paths = set(relative_paths or snapshots.keys())
+        with self._lock:
+            for relative_path, snapshot in snapshots.items():
+                if relative_path not in target_paths:
+                    continue
+                previous = self._file_states.get(relative_path)
+                self._file_states[relative_path] = _KnowledgeFileState(
+                    name=snapshot.name,
+                    relative_path=snapshot.relative_path,
+                    suffix=snapshot.suffix,
+                    size_bytes=snapshot.size_bytes,
+                    updated_at=snapshot.updated_at,
+                    content_hash=snapshot.content_hash,
+                    status="failed",
+                    chunk_count=previous.chunk_count if previous is not None else 0,
+                    indexed_at=previous.indexed_at if previous is not None else None,
+                    error=error,
+                    job_id=job_id,
+                )
+
+    def _records_for_file(
+        self,
+        *,
+        snapshot: _SourceFileSnapshot,
+        previous_records: list[_ChunkRecord],
+    ) -> list[_ChunkRecord]:
+        path = self._path_for_relative_source(snapshot.relative_path)
+        document_cls = self._document_class()
+        documents = self._load_documents_from_paths(paths=[path], root=self._source_path, document_cls=document_cls)
+        chunks = [item for item in self._split_documents(documents) if str(getattr(item, "page_content", "")).strip()]
+        old_by_chunk_hash: dict[str, _ChunkRecord] = {}
+        for record in previous_records:
+            chunk_hash = str(record.metadata.get("knowledge_chunk_hash") or "")
+            if chunk_hash:
+                old_by_chunk_hash[chunk_hash] = record
+
+        prepared: list[tuple[int, Any, str, str]] = []
+        texts_to_embed: list[str] = []
+        for index, chunk in enumerate(chunks, start=1):
+            text = str(getattr(chunk, "page_content", "")).strip()
+            if not text:
+                continue
+            chunk_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            prepared.append((index, chunk, text, chunk_hash))
+            if chunk_hash not in old_by_chunk_hash:
+                texts_to_embed.append(text)
+
+        new_embeddings_iter = iter(self._embedder.embed_documents(texts_to_embed))
+        records: list[_ChunkRecord] = []
+        file_hash = hashlib.sha1(snapshot.relative_path.encode("utf-8")).hexdigest()[:12]
+        for index, chunk, text, chunk_hash in prepared:
+            old_record = old_by_chunk_hash.get(chunk_hash)
+            embedding = old_record.embedding if old_record is not None else next(new_embeddings_iter)
+            metadata = dict(getattr(chunk, "metadata", {}) or {})
+            metadata.update(
                 {
-                    "name": path.name,
-                    "relative_path": path.relative_to(self._source_path).as_posix()
-                    if self._source_path.is_dir()
-                    else path.name,
-                    "suffix": path.suffix.lower(),
-                    "size_bytes": stat.st_size,
-                    "updated_at": stat.st_mtime,
+                    "knowledge_relative_path": snapshot.relative_path,
+                    "knowledge_content_hash": snapshot.content_hash,
+                    "knowledge_chunk_hash": chunk_hash,
+                    "knowledge_chunk_index": index,
                 }
             )
-        return results
+            source_uri = str(metadata.get("source_uri") or metadata.get("source") or str(path))
+            source_type = str(metadata.get("source_type") or snapshot.suffix.lstrip(".") or "document")
+            title = str(metadata.get("title") or Path(source_uri).stem or snapshot.name)
+            records.append(
+                _ChunkRecord(
+                    chunk_id=f"{file_hash}_{index}_{chunk_hash[:12]}",
+                    title=title,
+                    source_uri=source_uri,
+                    source_type=source_type,
+                    text=text,
+                    embedding=embedding,
+                    metadata=metadata,
+                )
+            )
+        return records
+
+    def _path_for_relative_source(self, relative_path: str) -> Path:
+        if self._source_path.is_file():
+            return self._source_path
+        return (self._source_path / relative_path).resolve()
+
+    def _record_relative_path(self, record: _ChunkRecord) -> str | None:
+        metadata_path = record.metadata.get("knowledge_relative_path")
+        if isinstance(metadata_path, str) and metadata_path.strip():
+            return metadata_path.strip()
+        source_uri = str(record.metadata.get("source_uri") or record.source_uri or "")
+        raw_path = source_uri.split("#", 1)[0].split(":", 1)[0] if source_uri else ""
+        if not raw_path:
+            return None
+        try:
+            candidate = Path(raw_path)
+            if candidate.is_absolute() and self._source_path.exists():
+                root = self._source_path if self._source_path.is_dir() else self._source_path.parent
+                return candidate.relative_to(root).as_posix()
+        except ValueError:
+            return None
+        return None
 
     def _hybrid_search(
         self, *, query: str, query_embedding: list[float], top_k: int
@@ -613,6 +1159,10 @@ class LangChainRAGService:
             return payload
 
         if not self._chunk_records:
+            if self._load_error:
+                payload["status"] = "unavailable"
+                payload["reason"] = self._load_error
+                return payload
             payload["status"] = "empty"
             payload["reason"] = "rag_source_empty"
             return payload
@@ -680,73 +1230,21 @@ class LangChainRAGService:
         return payload
 
     def _ensure_index_loaded(self) -> None:
-        if self._index_ready:
+        if self._index_ready and not self._has_unindexed_source_changes():
             return
+        self._apply_incremental_index_update(force=False, job_id=None)
+
+    def _has_unindexed_source_changes(self) -> bool:
+        snapshots = self._current_source_snapshots()
         with self._lock:
-            if self._index_ready:
-                return
-            if self._vector_backend == "faiss" and self._try_restore_faiss_snapshot():
-                if self._hybrid_search_enabled and self._bm25_index is not None and self._chunk_records:
-                    doc_texts = [record.text for record in self._chunk_records]
-                    self._bm25_index.build(doc_texts)
-                self._index_ready = True
-                self._load_error = None
-                self._clear_query_cache()
-                return
-            if self._try_restore_generic_snapshot():
-                if self._hybrid_search_enabled and self._bm25_index is not None and self._chunk_records:
-                    doc_texts = [record.text for record in self._chunk_records]
-                    self._bm25_index.build(doc_texts)
-                self._index_ready = True
-                self._load_error = None
-                self._clear_query_cache()
-                return
-            documents = self._load_documents()
-            chunks = self._split_documents(documents)
-            if not chunks:
-                self._chunk_records = []
-                self._refresh_vector_backend([])
-                self._persist_generic_snapshot([])
-                self._index_ready = True
-                self._load_error = None
-                self._clear_query_cache()
-                return
-
-            prepared_chunks = [item for item in chunks if str(item.page_content).strip()]
-            texts = [str(item.page_content).strip() for item in prepared_chunks]
-            embeddings = self._embedder.embed_documents(texts)
-            records: list[_ChunkRecord] = []
-            for index, (chunk, embedding) in enumerate(zip(prepared_chunks, embeddings, strict=False), start=1):
-                text = str(chunk.page_content).strip()
-                if not text:
-                    continue
-                metadata = dict(getattr(chunk, "metadata", {}) or {})
-                source_uri = str(metadata.get("source_uri") or metadata.get("source") or "knowledge://unknown")
-                source_type = str(metadata.get("source_type") or "document")
-                title = str(metadata.get("title") or Path(source_uri).stem or f"chunk-{index}")
-                records.append(
-                    _ChunkRecord(
-                        chunk_id=f"chunk_{index}",
-                        title=title,
-                        source_uri=source_uri,
-                        source_type=source_type,
-                        text=text,
-                        embedding=embedding,
-                        metadata=metadata,
-                    )
-                )
-            self._chunk_records = records
-            self._refresh_vector_backend(records)
-            self._persist_generic_snapshot(records)
-
-            # Build BM25 index if hybrid search is enabled
-            if self._hybrid_search_enabled and self._bm25_index is not None and records:
-                doc_texts = [record.text for record in records]
-                self._bm25_index.build(doc_texts)
-
-            self._index_ready = True
-            self._load_error = None
-            self._clear_query_cache()
+            states = dict(self._file_states)
+        for relative_path, snapshot in snapshots.items():
+            state = states.get(relative_path)
+            if state is None or state.status in {"pending", "indexing"}:
+                return True
+            if state.content_hash != snapshot.content_hash:
+                return True
+        return any(relative_path not in snapshots for relative_path in states)
 
     def _refresh_vector_backend(self, records: list[_ChunkRecord]) -> None:
         if self._vector_backend != "faiss":
@@ -835,6 +1333,7 @@ class LangChainRAGService:
                 "semantic_chunking_enabled": self._semantic_chunking_enabled,
             },
             "source_signature": self._source_signature(),
+            "file_states": self._serialized_file_states(),
             "records": [
                 {
                     "chunk_id": row.chunk_id,
@@ -850,7 +1349,7 @@ class LangChainRAGService:
         }
         meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _try_restore_faiss_snapshot(self) -> bool:
+    def _try_restore_faiss_snapshot(self, *, strict_source_signature: bool = True) -> bool:
         if not self._faiss_index_path.exists() or not self._faiss_metadata_path.exists():
             return False
         try:
@@ -861,7 +1360,7 @@ class LangChainRAGService:
             return False
         if payload.get("version") != 1:
             return False
-        if payload.get("source_signature") != self._source_signature():
+        if strict_source_signature and not self._source_signature_matches(payload.get("source_signature")):
             return False
         if payload.get("embedding_model_signature") != self._rag_embedding_model_signature:
             return False
@@ -903,6 +1402,7 @@ class LangChainRAGService:
             return False
         self._chunk_records = records
         self._faiss_index = index
+        self._file_states = self._file_states_from_payload(payload)
         return True
 
     def _remove_faiss_sidecar_files(self) -> None:
@@ -925,6 +1425,7 @@ class LangChainRAGService:
                 "semantic_chunking_enabled": self._semantic_chunking_enabled,
             },
             "source_signature": self._source_signature(),
+            "file_states": self._serialized_file_states(),
             "records": [
                 {
                     "chunk_id": row.chunk_id,
@@ -940,7 +1441,7 @@ class LangChainRAGService:
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _try_restore_generic_snapshot(self) -> bool:
+    def _try_restore_generic_snapshot(self, *, strict_source_signature: bool = True) -> bool:
         if not self._snapshot_path.exists():
             return False
         try:
@@ -951,7 +1452,7 @@ class LangChainRAGService:
             return False
         if payload.get("version") != 1:
             return False
-        if payload.get("source_signature") != self._source_signature():
+        if strict_source_signature and not self._source_signature_matches(payload.get("source_signature")):
             return False
         if payload.get("embedding_model_signature") != self._rag_embedding_model_signature:
             return False
@@ -987,7 +1488,62 @@ class LangChainRAGService:
         if not records:
             return False
         self._chunk_records = records
+        self._file_states = self._file_states_from_payload(payload)
         return True
+
+    def _serialized_file_states(self) -> list[dict[str, Any]]:
+        return [
+            self._file_state_to_public_dict(state)
+            for state in sorted(self._file_states.values(), key=lambda item: item.relative_path)
+        ]
+
+    def _source_signature_matches(self, raw_signature: object) -> bool:
+        current_signature = self._source_signature()
+        if raw_signature == current_signature:
+            return True
+        if not isinstance(raw_signature, list):
+            return False
+        normalized: list[dict[str, Any]] = []
+        for item in raw_signature:
+            if not isinstance(item, dict):
+                return False
+            normalized.append(
+                {
+                    "name": item.get("name"),
+                    "relative_path": item.get("relative_path"),
+                    "suffix": item.get("suffix"),
+                    "size_bytes": item.get("size_bytes"),
+                    "updated_at": item.get("updated_at"),
+                    "content_hash": item.get("content_hash"),
+                }
+            )
+        return normalized == current_signature
+
+    def _file_states_from_payload(self, payload: dict[str, Any]) -> dict[str, _KnowledgeFileState]:
+        raw_states = payload.get("file_states")
+        if not isinstance(raw_states, list):
+            return {}
+        states: dict[str, _KnowledgeFileState] = {}
+        for item in raw_states:
+            if not isinstance(item, dict):
+                continue
+            relative_path = str(item.get("relative_path") or "").strip()
+            if not relative_path:
+                continue
+            states[relative_path] = _KnowledgeFileState(
+                name=str(item.get("name") or Path(relative_path).name),
+                relative_path=relative_path,
+                suffix=str(item.get("suffix") or Path(relative_path).suffix.lower()),
+                size_bytes=int(item.get("size_bytes") or 0),
+                updated_at=float(item.get("updated_at") or 0),
+                content_hash=str(item.get("content_hash") or "") or None,
+                status=str(item.get("status") or "pending"),
+                chunk_count=int(item.get("chunk_count") or 0),
+                indexed_at=float(item["indexed_at"]) if item.get("indexed_at") is not None else None,
+                error=str(item.get("error")) if item.get("error") is not None else None,
+                job_id=str(item.get("job_id")) if item.get("job_id") is not None else None,
+            )
+        return states
 
     def _query_cache_key(self, *, query: str, top_k: int) -> str:
         config_signature = {
@@ -1065,7 +1621,17 @@ class LangChainRAGService:
         return np.asarray(rows, dtype="float32")
 
     def _source_signature(self) -> list[dict[str, Any]]:
-        return self.list_source_files()
+        return [
+            {
+                "name": item.name,
+                "relative_path": item.relative_path,
+                "suffix": item.suffix,
+                "size_bytes": item.size_bytes,
+                "updated_at": item.updated_at,
+                "content_hash": item.content_hash,
+            }
+            for item in sorted(self._current_source_snapshots().values(), key=lambda row: row.relative_path)
+        ]
 
     def _load_documents(self) -> list[Any]:
         document_cls = self._document_class()
@@ -1075,13 +1641,18 @@ class LangChainRAGService:
 
         if self._source_path.is_file():
             paths = [self._source_path]
+            root = self._source_path.parent
         else:
+            root = self._source_path
             paths = sorted(
                 path
                 for path in self._source_path.rglob("*")
-                if path.is_file() and path.suffix.lower() in {".md", ".txt", ".json", ".jsonl", ".pdf", ".docx", ".doc"}
+                if path.is_file() and path.suffix.lower() in self._supported_suffixes
             )
 
+        return self._load_documents_from_paths(paths=paths, root=root, document_cls=document_cls)
+
+    def _load_documents_from_paths(self, *, paths: list[Path], root: Path, document_cls: Any) -> list[Any]:
         documents: list[Any] = []
         for path in paths:
             suffix = path.suffix.lower()

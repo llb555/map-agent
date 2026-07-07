@@ -587,6 +587,48 @@
   gap: 10px;
 }
 
+.knowledge-progress {
+  border: 1px solid rgba(111, 138, 127, 0.14);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.72);
+  padding: 12px 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.knowledge-progress-copy {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.knowledge-progress-copy strong {
+  color: #1c6556;
+}
+
+.knowledge-progress-copy span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.4;
+  text-align: right;
+}
+
+.knowledge-progress-track {
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(101, 132, 119, 0.12);
+  overflow: hidden;
+}
+
+.knowledge-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #2d8f78, #d7a548);
+  transition: width 0.25s ease;
+}
+
 .knowledge-status-pill {
   border: 1px solid rgba(111, 138, 127, 0.14);
   border-radius: 18px;
@@ -780,6 +822,27 @@
   font-size: 0.76rem;
 }
 
+.knowledge-file-badges .knowledge-index-badge {
+  color: #41514c;
+  background: #f3efe5;
+}
+
+.knowledge-file-badges .knowledge-index-badge.is-ready {
+  color: #1d6a59;
+  background: #e7f5ef;
+}
+
+.knowledge-file-badges .knowledge-index-badge.is-indexing,
+.knowledge-file-badges .knowledge-index-badge.is-pending {
+  color: #8a5a10;
+  background: #fff4d8;
+}
+
+.knowledge-file-badges .knowledge-index-badge.is-failed {
+  color: #9c3a2c;
+  background: #fff1ed;
+}
+
 .knowledge-file-check {
   display: inline-flex;
   align-items: center;
@@ -796,6 +859,11 @@
   color: var(--muted);
   font-size: 0.82rem;
   word-break: break-word;
+}
+
+.knowledge-file-item .knowledge-file-error {
+  margin-top: 8px;
+  color: #9c3a2c;
 }
 
 .knowledge-file-meta {

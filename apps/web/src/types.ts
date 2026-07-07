@@ -1,7 +1,31 @@
-export type RegionItem = {
-  code: string;
-  name: string;
-};
+import type {
+  ArcadeDetailDto,
+  ArcadeGeoDto,
+  ArcadeSummaryDto,
+  ArcadeTitleDto,
+  ChatAttachmentDto,
+  ChatHistoryTurnDto,
+  ChatRequest as GeneratedChatRequest,
+  ChatResponse as GeneratedChatResponse,
+  ChatSessionDetailDto,
+  ChatSessionDispatchDto,
+  ChatSessionSummaryDto,
+  ClientLocationContext as GeneratedClientLocationContext,
+  GeoPoint as GeneratedGeoPoint,
+  KnowledgeArcadeCandidateDto,
+  KnowledgeFileItemDto,
+  KnowledgeLookupHitDto,
+  KnowledgeLookupResponseDto,
+  KnowledgeStatusDto,
+  KnowledgeUploadResponseDto,
+  PagedArcadesDto,
+  RegionItemDto,
+  ReverseGeocodeRequest as GeneratedReverseGeocodeRequest,
+  ReverseGeocodeResponse as GeneratedReverseGeocodeResponse,
+  RouteSummaryDto
+} from "./generated/httpContract";
+
+export type RegionItem = RegionItemDto;
 
 export type ViewMode = "chat" | "arcades" | "knowledge";
 
@@ -11,7 +35,7 @@ export type CoordSystem = "gcj02" | "wgs84";
 export type GeoSource = "catalog" | "geocode" | "client" | "route";
 export type GeoPrecision = "exact" | "approx";
 
-export type GeoPoint = {
+export type GeoPoint = Omit<GeneratedGeoPoint, "coord_system" | "source" | "precision"> & {
   lng: number;
   lat: number;
   coord_system: CoordSystem;
@@ -19,14 +43,14 @@ export type GeoPoint = {
   precision: GeoPrecision;
 };
 
-export type ArcadeGeo = {
+export type ArcadeGeo = Omit<ArcadeGeoDto, "gcj02" | "wgs84" | "source" | "precision"> & {
   gcj02?: GeoPoint | null;
   wgs84?: GeoPoint | null;
   source: GeoSource;
   precision: GeoPrecision;
 };
 
-export type ArcadeSummary = {
+export type ArcadeSummary = Omit<ArcadeSummaryDto, "arcade_count" | "geo"> & {
   source: string;
   source_id: number;
   source_url: string;
@@ -55,18 +79,9 @@ export type ArcadeSummary = {
   geo?: ArcadeGeo | null;
 };
 
-export type ArcadeTitle = {
-  id?: number | null;
-  title_id?: string | number | null;
-  title_name?: string | null;
-  quantity?: number | null;
-  version?: string | null;
-  coin?: string | number | null;
-  eacoin?: string | number | null;
-  comment?: string | null;
-};
+export type ArcadeTitle = ArcadeTitleDto;
 
-export type ArcadeDetail = ArcadeSummary & {
+export type ArcadeDetail = ArcadeSummary & Omit<ArcadeDetailDto, "arcades" | "events" | "geo" | "arcade_count"> & {
   comment?: string | null;
   url?: string | null;
   image_thumb?: Record<string, unknown> | null;
@@ -75,7 +90,7 @@ export type ArcadeDetail = ArcadeSummary & {
   collab?: boolean | null;
 };
 
-export type PagedArcades = {
+export type PagedArcades = Omit<PagedArcadesDto, "items"> & {
   items: ArcadeSummary[];
   page: number;
   page_size: number;
@@ -86,32 +101,18 @@ export type PagedArcades = {
 export type IntentType = "search" | "search_nearby" | "navigate";
 export type ChatSessionStatus = "idle" | "running" | "completed" | "failed";
 
-export type ClientLocationContext = {
-  lng: number;
-  lat: number;
-  accuracy_m?: number | null;
-  province?: string | null;
-  city?: string | null;
-  district?: string | null;
-  township?: string | null;
-  adcode?: string | null;
-  formatted_address?: string | null;
-  region_text?: string | null;
-};
+export type ClientLocationContext = GeneratedClientLocationContext;
 
-export type ReverseGeocodeRequest = {
-  lng: number;
-  lat: number;
-  accuracy_m?: number | null;
-};
+export type ReverseGeocodeRequest = GeneratedReverseGeocodeRequest;
 
-export type ReverseGeocodeResponse = ClientLocationContext & {
+export type ReverseGeocodeResponse = GeneratedReverseGeocodeResponse & ClientLocationContext & {
   resolved: boolean;
 };
 
-export type ChatRequest = {
+export type ChatRequest = GeneratedChatRequest & {
   session_id?: string;
   client_id?: string;
+  idempotency_key?: string;
   message: string;
   intent?: IntentType;
   shop_id?: number;
@@ -124,7 +125,7 @@ export type ChatRequest = {
   attachments?: ChatAttachment[];
 };
 
-export type ChatAttachment = {
+export type ChatAttachment = ChatAttachmentDto & {
   name: string;
   mime_type: string;
   size_bytes: number;
@@ -133,7 +134,8 @@ export type ChatAttachment = {
   image_data_url?: string | null;
 };
 
-export type RouteSummary = {
+export type RouteSummary = Omit<RouteSummaryDto, "origin" | "destination" | "polyline"> & {
+  schema_version?: number;
   provider: "amap" | "google" | "none";
   mode: string;
   distance_m?: number | null;
@@ -146,29 +148,43 @@ export type RouteSummary = {
 
 export type AgentMapScene = "agent_candidates" | "agent_route";
 
+export type MapViewPayload = {
+  schema_version?: number;
+  version?: number;
+  scene?: AgentMapScene;
+  title?: string | null;
+  [key: string]: unknown;
+};
+
 export type ChatMapArtifacts = {
+  schema_version: number;
+  scene: AgentMapScene;
   shops: ArcadeSummary[];
   route?: RouteSummary | null;
   client_location?: ClientLocationContext | null;
   destination?: ArcadeSummary | null;
-  view_payload?: Record<string, unknown> | null;
+  view_payload?: MapViewPayload | null;
   route_pending?: boolean;
 };
 
-export type ChatResponse = {
+export type ChatResponse = Omit<GeneratedChatResponse, "shops" | "route" | "map_artifact"> & {
   session_id: string;
   intent: IntentType;
   reply: string;
   shops: ArcadeSummary[];
   route?: RouteSummary | null;
+  map_artifact?: ChatMapArtifacts | null;
 };
 
-export type ChatSessionDispatch = {
+export type ChatSessionDispatch = Omit<ChatSessionDispatchDto, "status" | "run_status" | "last_stream_offset"> & {
   session_id: string;
   status: ChatSessionStatus;
+  run_status: ChatSessionStatus;
+  idempotency_key?: string | null;
+  last_stream_offset: number;
 };
 
-export type ChatHistoryTurn = {
+export type ChatHistoryTurn = ChatHistoryTurnDto & {
   role: "user" | "assistant" | "tool";
   content: string;
   name?: string | null;
@@ -177,7 +193,7 @@ export type ChatHistoryTurn = {
   created_at: string;
 };
 
-export type ChatSessionSummary = {
+export type ChatSessionSummary = ChatSessionSummaryDto & {
   session_id: string;
   title: string;
   preview?: string | null;
@@ -188,33 +204,49 @@ export type ChatSessionSummary = {
   updated_at: string;
 };
 
-export type ChatSessionDetail = {
+export type ChatSessionDetail = Omit<
+  ChatSessionDetailDto,
+  "status" | "run_status" | "shops" | "route" | "client_location" | "destination" | "view_payload" | "map_artifact" | "turns" | "last_stream_offset"
+> & {
   session_id: string;
   intent: IntentType;
   active_subagent: string;
   status: ChatSessionStatus;
+  run_status: ChatSessionStatus;
+  idempotency_key?: string | null;
+  last_stream_offset: number;
   last_error?: string | null;
   reply?: string | null;
   shops: ArcadeSummary[];
   route?: RouteSummary | null;
   client_location?: ClientLocationContext | null;
   destination?: ArcadeSummary | null;
-  view_payload?: Record<string, unknown> | null;
+  view_payload?: MapViewPayload | null;
+  map_artifact?: ChatMapArtifacts | null;
   turn_count: number;
   created_at: string;
   updated_at: string;
   turns: ChatHistoryTurn[];
 };
 
-export type KnowledgeFileItem = {
+export type KnowledgeFileItem = Omit<KnowledgeFileItemDto, "status" | "chunk_count"> & {
   name: string;
   relative_path: string;
   suffix: string;
   size_bytes: number;
   updated_at: number;
+  status: "pending" | "indexing" | "ready" | "failed";
+  chunk_count: number;
+  content_hash?: string | null;
+  indexed_at?: number | null;
+  error?: string | null;
+  job_id?: string | null;
 };
 
-export type KnowledgeStatus = {
+export type KnowledgeStatus = Omit<
+  KnowledgeStatusDto,
+  "pending_count" | "indexing_count" | "ready_count" | "failed_count" | "job_count" | "files"
+> & {
   directory: string;
   enabled: boolean;
   source_exists: boolean;
@@ -225,24 +257,24 @@ export type KnowledgeStatus = {
   hybrid_search_enabled: boolean;
   index_ready: boolean;
   chunk_count: number;
+  pending_count: number;
+  indexing_count: number;
+  ready_count: number;
+  failed_count: number;
+  job_count: number;
+  active_job_id?: string | null;
   load_error?: string | null;
   files: KnowledgeFileItem[];
 };
 
-export type KnowledgeUploadResponse = {
+export type KnowledgeUploadResponse = Omit<KnowledgeUploadResponseDto, "file" | "rag"> & {
   file: KnowledgeFileItem;
   rag: KnowledgeStatus;
 };
 
-export type KnowledgeLookupHit = {
-  title?: string | null;
-  source_uri?: string | null;
-  source_type?: string | null;
-  score?: number | null;
-  snippet?: string | null;
-};
+export type KnowledgeLookupHit = KnowledgeLookupHitDto;
 
-export type KnowledgeArcadeCandidate = {
+export type KnowledgeArcadeCandidate = Omit<KnowledgeArcadeCandidateDto, "geo"> & {
   id: string;
   name: string;
   address?: string | null;
@@ -257,7 +289,7 @@ export type KnowledgeArcadeCandidate = {
   geo?: ArcadeGeo | null;
 };
 
-export type KnowledgeLookupResponse = {
+export type KnowledgeLookupResponse = Omit<KnowledgeLookupResponseDto, "total_hits" | "hits" | "arcade_candidates"> & {
   query: string;
   status: string;
   total_hits: number;
@@ -265,25 +297,7 @@ export type KnowledgeLookupResponse = {
   arcade_candidates: KnowledgeArcadeCandidate[];
 };
 
-export type ChatStreamEventName =
-  | "session.started"
-  | "subagent.changed"
-  | "worker.started"
-  | "worker.completed"
-  | "worker.failed"
-  | "assistant.token"
-  | "tool.started"
-  | "tool.progress"
-  | "tool.completed"
-  | "tool.failed"
-  | "navigation.route_ready"
-  | "assistant.completed"
-  | "session.failed";
-
-export type ChatStreamEnvelope = {
-  id: number;
-  session_id: string;
-  event: ChatStreamEventName;
-  at: string;
-  data: Record<string, unknown>;
-};
+export type {
+  ChatStreamEnvelope,
+  ChatStreamEventName
+} from "./generated/chatStreamContract";

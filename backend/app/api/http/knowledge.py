@@ -29,6 +29,10 @@ class KnowledgeBatchDeleteRequest(BaseModel):
     relative_paths: list[str] = Field(default_factory=list)
 
 
+class KnowledgeRetryRequest(BaseModel):
+    relative_path: str = Field(..., min_length=1)
+
+
 def _build_knowledge_status(container: AppContainer) -> KnowledgeStatusDto:
     rag_health = container.rag_service.health()
     files = [
@@ -46,6 +50,12 @@ def _build_knowledge_status(container: AppContainer) -> KnowledgeStatusDto:
         hybrid_search_enabled=bool(rag_health.get("hybrid_search_enabled")),
         index_ready=bool(rag_health.get("index_ready")),
         chunk_count=int(rag_health.get("chunk_count") or 0),
+        pending_count=int(rag_health.get("pending_count") or 0),
+        indexing_count=int(rag_health.get("indexing_count") or 0),
+        ready_count=int(rag_health.get("ready_count") or 0),
+        failed_count=int(rag_health.get("failed_count") or 0),
+        job_count=int(rag_health.get("job_count") or 0),
+        active_job_id=str(rag_health.get("active_job_id")) if rag_health.get("active_job_id") is not None else None,
         load_error=str(rag_health.get("load_error")) if rag_health.get("load_error") is not None else None,
         files=files,
     )
@@ -238,7 +248,19 @@ def lookup_knowledge(
 @router.post("/reindex", response_model=KnowledgeStatusDto)
 def reindex_knowledge(container: AppContainer = Depends(get_container)) -> KnowledgeStatusDto:
     try:
-        container.rag_service.rebuild_index()
+        container.rag_service.enqueue_reindex(kind="full_reindex")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc).strip() or type(exc).__name__) from exc
+    return _build_knowledge_status(container)
+
+
+@router.post("/files/retry", response_model=KnowledgeStatusDto)
+def retry_knowledge_file(
+    payload: KnowledgeRetryRequest,
+    container: AppContainer = Depends(get_container),
+) -> KnowledgeStatusDto:
+    try:
+        container.rag_service.retry_failed_file(payload.relative_path.strip())
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc).strip() or type(exc).__name__) from exc
     return _build_knowledge_status(container)
@@ -270,35 +292,26 @@ async def upload_knowledge_file(
     payload = await file.read()
     target_path.write_bytes(payload)
 
+    stat = target_path.stat()
+    relative_path = target_path.relative_to(target_dir).as_posix()
     try:
-        rag_status = container.rag_service.rebuild_index()
+        container.rag_service.enqueue_reindex(relative_paths=[relative_path], kind="upload")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc).strip() or type(exc).__name__) from exc
-
-    stat = target_path.stat()
-    uploaded = KnowledgeFileItemDto(
-        name=target_path.name,
-        relative_path=target_path.relative_to(target_dir).as_posix(),
-        suffix=target_path.suffix.lower(),
-        size_bytes=stat.st_size,
-        updated_at=stat.st_mtime,
-    )
+    rag_status = _build_knowledge_status(container)
+    uploaded = next((item for item in rag_status.files if item.relative_path == relative_path), None)
+    if uploaded is None:
+        uploaded = KnowledgeFileItemDto(
+            name=target_path.name,
+            relative_path=relative_path,
+            suffix=target_path.suffix.lower(),
+            size_bytes=stat.st_size,
+            updated_at=stat.st_mtime,
+            status="pending",
+        )
     return KnowledgeUploadResponseDto(
         file=uploaded,
-        rag=KnowledgeStatusDto(
-            directory=str(container.rag_service.knowledge_directory()),
-            enabled=bool(rag_status.get("enabled")),
-            source_exists=bool(rag_status.get("source_exists")),
-            source_is_dir=bool(rag_status.get("source_is_dir")),
-            supported_suffixes=list(rag_status.get("supported_suffixes") or []),
-            semantic_chunking_enabled=bool(rag_status.get("semantic_chunking_enabled")),
-            reranker_enabled=bool(rag_status.get("reranker_enabled")),
-            hybrid_search_enabled=bool(rag_status.get("hybrid_search_enabled")),
-            index_ready=bool(rag_status.get("index_ready")),
-            chunk_count=int(rag_status.get("chunk_count") or 0),
-            load_error=str(rag_status.get("load_error")) if rag_status.get("load_error") is not None else None,
-            files=[KnowledgeFileItemDto(**item) for item in container.rag_service.list_source_files()],
-        ),
+        rag=rag_status,
     )
 
 
@@ -321,7 +334,7 @@ def delete_knowledge_file(
     target_path.unlink()
 
     try:
-        container.rag_service.rebuild_index()
+        container.rag_service.enqueue_reindex(relative_paths=[relative_path], kind="delete")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc).strip() or type(exc).__name__) from exc
 
@@ -357,7 +370,10 @@ def delete_knowledge_files_batch(
         target_path.unlink()
 
     try:
-        container.rag_service.rebuild_index()
+        container.rag_service.enqueue_reindex(
+            relative_paths=[path.relative_to(target_dir).as_posix() for path in validated_paths],
+            kind="delete",
+        )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc).strip() or type(exc).__name__) from exc
 

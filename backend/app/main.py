@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from time import perf_counter
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,9 +57,11 @@ def create_app() -> FastAPI:
     async def access_log(request: Request, call_next):
         start = perf_counter()
         status_code = 500
+        trace_id = request.headers.get("x-request-trace-id") or f"srv_{uuid4().hex[:16]}"
         try:
             response = await call_next(request)
             status_code = response.status_code
+            response.headers["X-Request-Trace-Id"] = trace_id
             return response
         finally:
             duration_ms = (perf_counter() - start) * 1000
@@ -66,12 +69,13 @@ def create_app() -> FastAPI:
             path = f"{request.url.path}{query}"
             client_ip = request.client.host if request.client else "-"
             access_logger.info(
-                '%s "%s %s" %s %.2fms',
+                '%s "%s %s" %s %.2fms trace_id=%s',
                 client_ip,
                 request.method,
                 path,
                 status_code,
                 duration_ms,
+                trace_id,
             )
 
     app.include_router(health_router)

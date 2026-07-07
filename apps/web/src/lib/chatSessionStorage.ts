@@ -1,8 +1,10 @@
 const CLIENT_ID_KEY = "arcadegent.chat.clientId.v1";
 const ACTIVE_SESSION_ID_KEY = "arcadegent.chat.activeSessionId.v1";
+const STREAM_OFFSETS_KEY = "arcadegent.chat.streamOffsets.v1";
 
 let fallbackClientId: string | null = null;
 let fallbackActiveSessionId: string | null = null;
+let fallbackStreamOffsets: Record<string, number> = {};
 
 function makeLocalId(prefix: string): string {
   const cryptoApi = typeof globalThis.crypto !== "undefined" ? globalThis.crypto : null;
@@ -73,5 +75,48 @@ export function writeStoredActiveSessionId(sessionId: string | null): void {
     }
   } catch {
     // Keep the in-memory fallback so the active tab still behaves consistently.
+  }
+}
+
+export function readStoredStreamOffsets(): Record<string, number> {
+  const storage = readLocalStorage();
+  if (!storage) {
+    return { ...fallbackStreamOffsets };
+  }
+  try {
+    const raw = JSON.parse(storage.getItem(STREAM_OFFSETS_KEY) || "{}");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return {};
+    }
+    const offsets: Record<string, number> = {};
+    Object.entries(raw).forEach(([sessionId, offset]) => {
+      if (typeof offset === "number" && Number.isFinite(offset) && offset > 0) {
+        offsets[sessionId] = offset;
+      }
+    });
+    return offsets;
+  } catch {
+    return {};
+  }
+}
+
+export function writeStoredStreamOffset(sessionId: string, offset: number): void {
+  if (!sessionId || !Number.isFinite(offset) || offset <= 0) {
+    return;
+  }
+  fallbackStreamOffsets = {
+    ...fallbackStreamOffsets,
+    [sessionId]: Math.max(fallbackStreamOffsets[sessionId] ?? 0, offset)
+  };
+  const storage = readLocalStorage();
+  if (!storage) {
+    return;
+  }
+  try {
+    const offsets = readStoredStreamOffsets();
+    offsets[sessionId] = Math.max(offsets[sessionId] ?? 0, offset);
+    storage.setItem(STREAM_OFFSETS_KEY, JSON.stringify(offsets));
+  } catch {
+    // The in-memory fallback keeps reconnect working for the active tab.
   }
 }

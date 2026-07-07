@@ -477,7 +477,89 @@ async function installChatApiMocks(page: Page) {
       }
     });
   });
+  await page.route("**/api/chat/sessions/s_e2e**", async (route) => {
+    await route.fulfill({
+      json: {
+        session_id: "s_e2e",
+        intent: "navigate",
+        active_subagent: "main_agent",
+        status: "completed",
+        run_status: "completed",
+        idempotency_key: null,
+        last_stream_offset: 2,
+        last_error: null,
+        reply: "路线已经准备好了，建议步行前往 Arcade One。",
+        shops: [ARCADES[0], ARCADES[2]],
+        route: CHAT_ROUTE,
+        client_location: {
+          lng: 121.4,
+          lat: 31.2,
+          accuracy_m: 25,
+          city: "上海市",
+          region_text: "上海市"
+        },
+        destination: ARCADES[0],
+        view_payload: {
+          schema_version: 1,
+          scene: "agent_route",
+          title: "从当前位置前往 Arcade One"
+        },
+        map_artifact: {
+          schema_version: 1,
+          scene: "agent_route",
+          shops: [ARCADES[0], ARCADES[2]],
+          route: CHAT_ROUTE,
+          client_location: {
+            lng: 121.4,
+            lat: 31.2,
+            accuracy_m: 25,
+            city: "上海市",
+            region_text: "上海市"
+          },
+          destination: ARCADES[0],
+          view_payload: {
+            schema_version: 1,
+            scene: "agent_route",
+            title: "从当前位置前往 Arcade One"
+          }
+        },
+        turn_count: 2,
+        created_at: "2026-04-15T00:00:00Z",
+        updated_at: "2026-04-15T00:00:10Z",
+        turns: [
+          {
+            role: "user",
+            content: "给我一条到 Arcade One 的路线",
+            created_at: "2026-04-15T00:00:00Z"
+          },
+          {
+            role: "assistant",
+            content: "路线已经准备好了，建议步行前往 Arcade One。",
+            created_at: "2026-04-15T00:00:10Z"
+          }
+        ]
+      }
+    });
+  });
   await page.route("**/api/v1/chat/sessions?**", async (route) => {
+    await route.fulfill({
+      json: sessionVisible
+        ? [
+          {
+            session_id: "s_e2e",
+            title: "给我一条到 Arcade One 的路线",
+            preview: "路线已经准备好了",
+            intent: "navigate",
+            status: "completed",
+            turn_count: 2,
+            created_at: "2026-04-15T00:00:00Z",
+            updated_at: "2026-04-15T00:00:10Z"
+          }
+        ]
+        : []
+    });
+  });
+  await page.route("**/api/chat/sessions?**", async (route) => {
     await route.fulfill({
       json: sessionVisible
         ? [
@@ -515,6 +597,78 @@ async function installChatApiMocks(page: Page) {
         region_text: "上海市"
       }
     });
+  });
+}
+
+async function installKnowledgeManagerMocks(page: Page) {
+  let uploaded = false;
+  const readyStatus = () => ({
+    directory: "/tmp/e2e-knowledge",
+    enabled: true,
+    source_exists: true,
+    source_is_dir: true,
+    supported_suffixes: [".md", ".txt", ".json", ".jsonl", ".pdf", ".docx", ".doc"],
+    semantic_chunking_enabled: false,
+    reranker_enabled: false,
+    hybrid_search_enabled: true,
+    index_ready: true,
+    chunk_count: uploaded ? 4 : 2,
+    pending_count: 0,
+    indexing_count: 0,
+    ready_count: uploaded ? 2 : 1,
+    failed_count: 0,
+    job_count: uploaded ? 1 : 0,
+    active_job_id: null,
+    load_error: null,
+    files: [
+      {
+        name: "arcade-faq.md",
+        relative_path: "arcade-faq.md",
+        suffix: ".md",
+        size_bytes: 1280,
+        updated_at: 1783315200,
+        status: "ready",
+        chunk_count: 2,
+        content_hash: "hash-faq",
+        indexed_at: 1783315260,
+        error: null,
+        job_id: null
+      },
+      ...(uploaded
+        ? [
+          {
+            name: "new-notes.md",
+            relative_path: "new-notes.md",
+            suffix: ".md",
+            size_bytes: 44,
+            updated_at: 1783315300,
+            status: "ready",
+            chunk_count: 2,
+            content_hash: "hash-notes",
+            indexed_at: 1783315310,
+            error: null,
+            job_id: "job-upload"
+          }
+        ]
+        : [])
+    ]
+  });
+
+  await page.route("**/api/knowledge/status", async (route) => {
+    await route.fulfill({ json: readyStatus() });
+  });
+  await page.route("**/api/knowledge/upload", async (route) => {
+    uploaded = true;
+    const status = readyStatus();
+    await route.fulfill({
+      json: {
+        file: status.files[1],
+        rag: status
+      }
+    });
+  });
+  await page.route("**/api/knowledge/reindex", async (route) => {
+    await route.fulfill({ json: readyStatus() });
   });
 }
 
@@ -596,7 +750,7 @@ test("ChatPanel shows progressive route card from SSE route_ready", async ({ pag
   await installChatApiMocks(page);
 
   await page.goto("/");
-  await page.getByPlaceholder("尽管问机厅相关问题").fill("给我一条到 Arcade One 的路线");
+  await page.getByPlaceholder("直接输入机厅、区域、路线，或带着文件和图片一起提问").fill("给我一条到 Arcade One 的路线");
   await page.getByRole("button", { name: "发送" }).click();
 
   await expect(page.getByTestId("agent-route-card")).toBeVisible();
@@ -605,4 +759,36 @@ test("ChatPanel shows progressive route card from SSE route_ready", async ({ pag
   await expect(page.getByTestId("map-action-route-web")).toHaveAttribute("href", /callnative=0/);
   await expect(page.getByTestId("map-action-route-app")).toHaveAttribute("href", /callnative=1/);
   await expect(page.getByText("路线已经准备好了，建议步行前往 Arcade One。")).toBeVisible();
+});
+
+test("golden chain covers ask, streaming route map, and knowledge index status", async ({ page }) => {
+  await installAmapMock(page);
+  await installStreamMock(page);
+  await installApiMocks(page);
+  await installChatApiMocks(page);
+  await installKnowledgeManagerMocks(page);
+
+  await page.goto("/");
+  await page.getByPlaceholder("直接输入机厅、区域、路线，或带着文件和图片一起提问").fill("给我一条到 Arcade One 的路线");
+  await page.getByRole("button", { name: "发送" }).click();
+
+  await expect(page.getByText(/路线已生成|最终回复已生成/)).toBeVisible();
+  await expect(page.getByTestId("agent-route-card")).toBeVisible();
+  await expect(page.getByTestId("map-action-route-web")).toBeVisible();
+  await expect(page.getByText("路线已经准备好了，建议步行前往 Arcade One。")).toBeVisible();
+
+  await page.getByRole("button", { name: "知识库" }).click();
+  await expect(page.getByText("把知识文件变成可追踪的增量索引任务。")).toBeVisible();
+  await expect(page.getByText("arcade-faq.md").first()).toBeVisible();
+  await expect(page.getByText("1 ready · 0 pending · 0 indexing · 0 failed")).toBeVisible();
+
+  await page.locator("input[type='file']").setInputFiles({
+    name: "new-notes.md",
+    mimeType: "text/markdown",
+    buffer: Buffer.from("# New notes\n\nArcade One has updated route tips.")
+  });
+
+  await expect(page.getByText("已上传 new-notes.md，已加入后台索引队列")).toBeVisible();
+  await expect(page.getByText("new-notes.md").first()).toBeVisible();
+  await expect(page.getByText("2 ready · 0 pending · 0 indexing · 0 failed")).toBeVisible();
 });

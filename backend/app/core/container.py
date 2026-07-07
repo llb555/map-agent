@@ -51,7 +51,10 @@ class AppContainer:
 def build_container(settings: Settings) -> AppContainer:
     """Construct runtime dependencies in one place."""
     store = _build_arcade_repository(settings)
-    replay_buffer = ReplayBuffer(max_events_per_session=settings.replay_buffer_size)
+    replay_buffer = ReplayBuffer(
+        max_events_per_session=settings.replay_buffer_size,
+        storage_path=settings.chat_stream_event_store_path,
+    )
     provider_adapter = ProviderAdapter(resolve_llm_config(settings))
     vision_config = resolve_vision_llm_config(settings)
     vision_provider_adapter = ProviderAdapter(vision_config) if vision_config is not None else None
@@ -127,6 +130,7 @@ def build_container(settings: Settings) -> AppContainer:
         storage_path=settings.chat_session_store_path,
         flush_interval_seconds=settings.chat_session_flush_interval_seconds,
     )
+    replay_buffer.bind_session_store(session_store)
     react_runtime = ReactRuntime(
         context_builder=context_builder,
         subagent_builder=subagent_builder,
@@ -139,6 +143,7 @@ def build_container(settings: Settings) -> AppContainer:
     )
     orchestrator = Orchestrator(
         react_runtime=react_runtime,
+        session_store=session_store,
     )
     return AppContainer(
         settings=settings,
