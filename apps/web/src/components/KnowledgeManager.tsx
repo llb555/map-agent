@@ -2,12 +2,17 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   deleteKnowledgeFile,
   deleteKnowledgeFilesBatch,
+  getCurrentUser,
   getKnowledgeStatus,
+  listKnowledgeSubmissions,
   reindexKnowledge,
+  reviewKnowledgeSubmission,
   retryKnowledgeFile,
-  uploadKnowledgeFile
+  submitKnowledgeFile,
+  uploadKnowledgeFile,
+  withdrawKnowledgeSubmission
 } from "../api/client";
-import type { KnowledgeFileItem, KnowledgeStatus } from "../types";
+import type { CurrentUser, KnowledgeFileItem, KnowledgeStatus, KnowledgeSubmission } from "../types";
 
 function formatSize(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -32,6 +37,13 @@ function hasActiveIndexing(status: KnowledgeStatus | null): boolean {
 
 export function KnowledgeManager() {
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const submissionInputRef = useRef<HTMLInputElement | null>(null);
+  const [currentUser, setCurrentUser] = useState<CurrentUser | null>(null);
+  const [submissions, setSubmissions] = useState<KnowledgeSubmission[]>([]);
+  const [submissionTitle, setSubmissionTitle] = useState("");
+  const [submissionDescription, setSubmissionDescription] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [reviewingId, setReviewingId] = useState("");
   const [status, setStatus] = useState<KnowledgeStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
@@ -58,7 +70,57 @@ export function KnowledgeManager() {
 
   useEffect(() => {
     void loadStatus();
+    void Promise.all([getCurrentUser(), listKnowledgeSubmissions()]).then(([user, items]) => {
+      setCurrentUser(user);
+      setSubmissions(items);
+    }).catch((err) => setError(err instanceof Error ? err.message : "加载投稿列表失败"));
   }, []);
+
+  async function handleSubmission(file: File | null) {
+    if (!file) return;
+    setSubmitting(true);
+    setError("");
+    setMessage("");
+    try {
+      const item = await submitKnowledgeFile(file, submissionTitle, submissionDescription);
+      setSubmissions((previous) => [item, ...previous]);
+      setSubmissionTitle("");
+      setSubmissionDescription("");
+      if (submissionInputRef.current) submissionInputRef.current.value = "";
+      setMessage(`${item.original_filename} 已进入审核队列`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "投稿失败");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleWithdraw(item: KnowledgeSubmission) {
+    setReviewingId(item.id);
+    try {
+      await withdrawKnowledgeSubmission(item.id);
+      setSubmissions((previous) => previous.map((row) => row.id === item.id ? { ...row, status: "withdrawn" } : row));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "撤回失败");
+    } finally {
+      setReviewingId("");
+    }
+  }
+
+  async function handleReview(item: KnowledgeSubmission, decision: "approved" | "rejected") {
+    const note = window.prompt(decision === "approved" ? "审核备注（可选）" : "请输入驳回原因", "") ?? "";
+    if (decision === "rejected" && !note.trim()) return;
+    setReviewingId(item.id);
+    try {
+      const updated = await reviewKnowledgeSubmission(item.id, decision, note);
+      setSubmissions((previous) => previous.map((row) => row.id === item.id ? updated : row));
+      if (decision === "approved") await loadStatus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "审核失败");
+    } finally {
+      setReviewingId("");
+    }
+  }
 
   useEffect(() => {
     if (!hasActiveIndexing(status)) {
@@ -207,6 +269,13 @@ export function KnowledgeManager() {
   const processedCount = status ? status.ready_count + status.failed_count : 0;
   const progressTotal = status ? Math.max(1, status.files.length) : 1;
   const progressPercent = Math.round((processedCount / progressTotal) * 100);
+  const isAdmin = currentUser?.role === "admin";
+  const submissionStatusLabel = {
+    pending: "待审核",
+    approved: "已发布",
+    rejected: "已驳回",
+    withdrawn: "已撤回"
+  } as const;
 
   return (
     <section className="knowledge-shell">
@@ -219,6 +288,49 @@ export function KnowledgeManager() {
           <span className="knowledge-hero-pill">{status ? `${status.chunk_count} 个 Chunk` : "等待索引状态"}</span>
           <span className="knowledge-hero-pill">{status ? `${status.ready_count}/${status.files.length} 已就绪` : "等待任务状态"}</span>
           <span className="knowledge-hero-pill">{status ? featureSummary : "等待能力状态"}</span>
+        </div>
+      </div>
+
+      <div className="knowledge-contribution-band browser-card">
+        <div className="knowledge-section-head">
+          <div className="knowledge-head-copy">
+            <strong>{isAdmin ? "投稿审核队列" : "贡献知识文档"}</strong>
+            <small>{isAdmin ? "审核通过后，文档才会进入正式知识库和增量索引。" : "投稿不会直接影响回答，管理员审核通过后才会发布。"}</small>
+          </div>
+          <span className="knowledge-review-count">{submissions.filter((item) => item.status === "pending").length} 待审核</span>
+        </div>
+
+        {!isAdmin ? (
+          <div className="knowledge-contribution-form">
+            <input value={submissionTitle} onChange={(event) => setSubmissionTitle(event.target.value)} placeholder="文档标题（可选）" maxLength={200} />
+            <input value={submissionDescription} onChange={(event) => setSubmissionDescription(event.target.value)} placeholder="来源与内容说明（可选）" maxLength={2000} />
+            <label className="knowledge-upload">
+              <input ref={submissionInputRef} type="file" disabled={submitting} onChange={(event) => void handleSubmission(event.target.files?.[0] ?? null)} />
+              <span>{submitting ? "提交中..." : "选择文件投稿"}</span>
+            </label>
+          </div>
+        ) : null}
+
+        <div className="knowledge-submission-list">
+          {!submissions.length ? <p className="knowledge-empty-state">当前没有投稿记录。</p> : null}
+          {submissions.map((item) => (
+            <article key={item.id} className="knowledge-submission-item">
+              <div>
+                <span className={`knowledge-submission-status is-${item.status}`}>{submissionStatusLabel[item.status]}</span>
+                <strong>{item.title || item.original_filename}</strong>
+                <p>{item.description || item.original_filename}</p>
+                <small>{isAdmin ? `${item.owner_email || item.owner_user_id} · ` : ""}{new Date(item.created_at).toLocaleString()} · {formatSize(item.size_bytes)}</small>
+                {item.review_note ? <p className="knowledge-review-note">审核意见：{item.review_note}</p> : null}
+              </div>
+              <div className="knowledge-submission-actions">
+                {!isAdmin && item.status === "pending" ? <button type="button" onClick={() => void handleWithdraw(item)} disabled={reviewingId === item.id}>撤回</button> : null}
+                {isAdmin && item.status === "pending" ? <>
+                  <button type="button" className="is-approve" onClick={() => void handleReview(item, "approved")} disabled={reviewingId === item.id}>通过</button>
+                  <button type="button" className="is-reject" onClick={() => void handleReview(item, "rejected")} disabled={reviewingId === item.id}>驳回</button>
+                </> : null}
+              </div>
+            </article>
+          ))}
         </div>
       </div>
 
@@ -295,7 +407,7 @@ export function KnowledgeManager() {
           {error ? <p className="knowledge-error">{error}</p> : null}
           {message ? <p className="knowledge-success">{message}</p> : null}
 
-          <div className="knowledge-actions">
+          {isAdmin ? <div className="knowledge-actions">
             <label className="knowledge-upload">
               <input
                 ref={inputRef}
@@ -314,7 +426,7 @@ export function KnowledgeManager() {
             >
               {reindexing ? "重建中..." : "重建索引"}
             </button>
-          </div>
+          </div> : null}
         </div>
 
         <div className="knowledge-panel browser-card">
@@ -323,7 +435,7 @@ export function KnowledgeManager() {
               <strong>已识别文件</strong>
               <small>{status ? `${status.files.length} 个文件，支持批量整理` : ""}</small>
             </div>
-            <div className="knowledge-toolbar">
+            {isAdmin ? <div className="knowledge-toolbar">
               <label className="knowledge-select-all">
                 <input
                   type="checkbox"
@@ -333,18 +445,18 @@ export function KnowledgeManager() {
                 />
                 <span>全选</span>
               </label>
-              <button
+              {isAdmin ? <button
                 type="button"
                 className="knowledge-delete-btn"
                 onClick={() => void handleBatchDelete()}
                 disabled={!selectedPaths.length || batchDeleting}
               >
                 {batchDeleting ? "批量删除中..." : `批量删除所选${selectedPaths.length ? ` (${selectedPaths.length})` : ""}`}
-              </button>
-            </div>
+              </button> : null}
+            </div> : null}
           </div>
 
-          {status?.files.length ? (
+          {isAdmin && status?.files.length ? (
             <div className={`knowledge-selection-bar${selectedPaths.length ? " is-active" : ""}`}>
               <div className="knowledge-selection-copy">
                 <strong>{selectedPaths.length ? `已选 ${selectedPaths.length} 个文件` : "尚未选择文件"}</strong>
@@ -370,7 +482,7 @@ export function KnowledgeManager() {
             {status?.files.map((file) => (
               <article key={file.relative_path} className="knowledge-file-item">
                 <div className="knowledge-file-head">
-                  <label className="knowledge-file-check">
+                  {isAdmin ? <label className="knowledge-file-check">
                     <input
                       type="checkbox"
                       checked={selectedPaths.includes(file.relative_path)}
@@ -378,7 +490,7 @@ export function KnowledgeManager() {
                       onChange={(event) => toggleSelected(file.relative_path, event.target.checked)}
                     />
                     <span className="sr-only">选择 {file.name}</span>
-                  </label>
+                  </label> : null}
                   <div className="knowledge-file-copy">
                     <div className="knowledge-file-badges">
                       <span>{file.suffix}</span>
@@ -391,7 +503,7 @@ export function KnowledgeManager() {
                     <p>{file.relative_path}</p>
                     {file.error ? <p className="knowledge-file-error">{file.error}</p> : null}
                   </div>
-                  {file.status === "failed" ? (
+                  {isAdmin && file.status === "failed" ? (
                     <button
                       type="button"
                       className="browser-secondary-btn"
@@ -401,14 +513,14 @@ export function KnowledgeManager() {
                       {retryingPath === file.relative_path ? "重试中..." : "重试"}
                     </button>
                   ) : null}
-                  <button
+                  {isAdmin ? <button
                     type="button"
                     className="knowledge-delete-btn"
                     onClick={() => void handleDelete(file)}
                     disabled={deletingPath === file.relative_path || batchDeleting}
                   >
                     {deletingPath === file.relative_path ? "删除中..." : "删除"}
-                  </button>
+                  </button> : null}
                 </div>
                 <div className="knowledge-file-meta">
                   <span>{formatDate(file.updated_at)}</span>

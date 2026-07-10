@@ -32,6 +32,8 @@ services:
         VITE_AMAP_WEB_KEY: ${VITE_AMAP_WEB_KEY:-}
         VITE_AMAP_SECURITY_JS_CODE: ${VITE_AMAP_SECURITY_JS_CODE:-}
         VITE_AMAP_URI_SRC: ${VITE_AMAP_URI_SRC:-arcadegent_web}
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:-}
     depends_on:
       backend:
         condition: service_healthy

@@ -10,12 +10,15 @@ import type {
   KnowledgeLookupResponse,
   KnowledgeStatus,
   KnowledgeUploadResponse,
+  KnowledgeSubmission,
+  CurrentUser,
   ReverseGeocodeRequest,
   ReverseGeocodeResponse,
   PagedArcades,
   RegionItem,
   SortOrder
 } from "../types";
+import { fetchWithAuth } from "../lib/auth";
 
 export type RequestOptions = {
   signal?: AbortSignal;
@@ -155,7 +158,7 @@ async function parseJsonResponse<T>(resp: Response, requestLabel: string): Promi
 async function fetchJson<T>(url: string, options: RequestOptions = {}): Promise<T> {
   const request = makeRequestSignal(options);
   try {
-    const resp = await fetch(url, {
+    const resp = await fetchWithAuth(url, {
       signal: request.signal,
       headers: requestHeaders(options, request.traceId)
     });
@@ -168,7 +171,7 @@ async function fetchJson<T>(url: string, options: RequestOptions = {}): Promise<
 async function postJson<T>(path: string, payload: unknown, options: RequestOptions = {}): Promise<T> {
   const request = makeRequestSignal(options);
   try {
-    const resp = await fetch(buildUrl(path), {
+    const resp = await fetchWithAuth(buildUrl(path), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -186,7 +189,7 @@ async function postJson<T>(path: string, payload: unknown, options: RequestOptio
 async function postFormData<T>(path: string, formData: FormData, options: RequestOptions = {}): Promise<T> {
   const request = makeRequestSignal({ timeoutMs: 60_000, ...options });
   try {
-    const resp = await fetch(buildUrl(path), {
+    const resp = await fetchWithAuth(buildUrl(path), {
       method: "POST",
       headers: requestHeaders(options, request.traceId),
       signal: request.signal,
@@ -205,7 +208,7 @@ async function deleteJson(
 ): Promise<void> {
   const request = makeRequestSignal(options);
   try {
-    const resp = await fetch(buildUrl(path, query), {
+    const resp = await fetchWithAuth(buildUrl(path, query), {
       method: "DELETE",
       headers: requestHeaders(options, request.traceId),
       signal: request.signal
@@ -303,6 +306,52 @@ export function buildChatStreamUrl(sessionId: string, lastEventId?: number, clie
   });
 }
 
+export type ChatStreamMessage = { event: string; data: string };
+
+export async function streamChatSession(
+  sessionId: string,
+  lastEventId: number | undefined,
+  clientId: string | undefined,
+  signal: AbortSignal,
+  onMessage: (message: ChatStreamMessage) => void
+): Promise<void> {
+  const response = await fetchWithAuth(buildChatStreamUrl(sessionId, lastEventId, clientId), {
+    headers: { Accept: "text/event-stream" },
+    signal
+  });
+  if (!response.ok || !response.body) {
+    throw new ApiRequestError({
+      status: response.status,
+      requestLabel: "chat stream",
+      traceId: response.headers.get("x-request-trace-id"),
+      detail: await response.text()
+    });
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      if (block && !block.startsWith(":")) {
+        let event = "message";
+        const data: string[] = [];
+        block.split("\n").forEach((line) => {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+        });
+        if (data.length) onMessage({ event, data: data.join("\n") });
+      }
+      boundary = buffer.indexOf("\n\n");
+    }
+  }
+}
+
 export async function listChatSessions(limit = 40, clientId?: string): Promise<ChatSessionSummary[]> {
   return fetchJson<ChatSessionSummary[]>(buildUrl("/api/chat/sessions", { limit, client_id: clientId }));
 }
@@ -325,6 +374,41 @@ export async function reverseGeocodeLocation(
 
 export async function getKnowledgeStatus(): Promise<KnowledgeStatus> {
   return fetchJson<KnowledgeStatus>(buildUrl("/api/knowledge/status"));
+}
+
+export async function getCurrentUser(): Promise<CurrentUser> {
+  return fetchJson<CurrentUser>(buildUrl("/api/auth/me"));
+}
+
+export async function listKnowledgeSubmissions(): Promise<KnowledgeSubmission[]> {
+  return fetchJson<KnowledgeSubmission[]>(buildUrl("/api/knowledge/submissions"));
+}
+
+export async function submitKnowledgeFile(
+  file: File,
+  title: string,
+  description: string
+): Promise<KnowledgeSubmission> {
+  const formData = new FormData();
+  formData.append("file", file);
+  if (title.trim()) formData.append("title", title.trim());
+  if (description.trim()) formData.append("description", description.trim());
+  return postFormData<KnowledgeSubmission>("/api/knowledge/submissions", formData);
+}
+
+export async function withdrawKnowledgeSubmission(id: string): Promise<void> {
+  return deleteJson(`/api/knowledge/submissions/${encodeURIComponent(id)}`);
+}
+
+export async function reviewKnowledgeSubmission(
+  id: string,
+  decision: "approved" | "rejected",
+  note: string
+): Promise<KnowledgeSubmission> {
+  return postJson<KnowledgeSubmission>(`/api/knowledge/submissions/${encodeURIComponent(id)}/review`, {
+    decision,
+    note: note.trim() || null
+  });
 }
 
 export async function lookupKnowledge(query: string, topK = 3, options?: RequestOptions): Promise<KnowledgeLookupResponse> {

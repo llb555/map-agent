@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.agent.context.context_builder import ContextBuilder
+from app.auth.jwt_verifier import JwtVerifier
 from app.agent.events.replay_buffer import ReplayBuffer
 from app.agent.llm.llm_config import resolve_llm_config, resolve_vision_llm_config
 from app.agent.llm.provider_adapter import ProviderAdapter
@@ -28,6 +29,8 @@ from app.services.arcade_payload_mapper import ArcadePayloadMapper
 from app.services.amap_reverse_geocoder import AMapReverseGeocoder, AMapReverseGeocoderConfig
 from app.services.region_catalog import AMapRegionCatalog, AMapRegionCatalogConfig
 from app.services.region_service import RegionService
+from app.services.knowledge_submissions import KnowledgeSubmissionStore
+from app.services.knowledge_submission_filter import KnowledgeSubmissionFilter
 
 
 @dataclass
@@ -46,6 +49,9 @@ class AppContainer:
     tool_registry: ToolRegistry
     react_runtime: ReactRuntime
     orchestrator: Orchestrator
+    jwt_verifier: JwtVerifier
+    knowledge_submission_store: KnowledgeSubmissionStore
+    knowledge_submission_filter: KnowledgeSubmissionFilter
 
 
 def build_container(settings: Settings) -> AppContainer:
@@ -145,6 +151,16 @@ def build_container(settings: Settings) -> AppContainer:
         react_runtime=react_runtime,
         session_store=session_store,
     )
+    jwt_verifier = JwtVerifier(settings)
+    knowledge_submission_store = KnowledgeSubmissionStore(
+        metadata_path=settings.knowledge_submission_store_path,
+        files_path=settings.knowledge_submission_files_path,
+    )
+    knowledge_submission_filter = KnowledgeSubmissionFilter(
+        blocked_keywords=settings.knowledge_submission_blocked_keywords,
+        reject_images=settings.knowledge_submission_reject_images,
+        scan_max_chars=settings.knowledge_submission_scan_max_chars,
+    )
     return AppContainer(
         settings=settings,
         store=store,
@@ -158,6 +174,9 @@ def build_container(settings: Settings) -> AppContainer:
         tool_registry=tool_registry,
         react_runtime=react_runtime,
         orchestrator=orchestrator,
+        jwt_verifier=jwt_verifier,
+        knowledge_submission_store=knowledge_submission_store,
+        knowledge_submission_filter=knowledge_submission_filter,
     )
 
 

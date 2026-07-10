@@ -12,7 +12,8 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Respon
 
 from app.agent.runtime.orchestrator import SessionAlreadyRunningError, SessionOwnershipError
 from app.agent.runtime.session_state import AgentSessionState, AgentTurn, get_working_memory_artifact
-from app.api.deps import get_container
+from app.api.deps import get_container, get_current_user
+from app.auth.models import CurrentUser
 from app.core.container import AppContainer
 from app.infra.observability.logger import get_logger
 from app.protocol.messages import (
@@ -31,6 +32,26 @@ from app.protocol.messages import (
 
 router = APIRouter(prefix="/api", tags=["chat"])
 logger = get_logger(__name__)
+
+
+def _authenticated_request(request: ChatRequest, user: CurrentUser | None) -> ChatRequest:
+    return request if user is None else request.model_copy(update={"client_id": user.id})
+
+
+def _owner_scope(client_id: str | None, user: CurrentUser | None) -> str | None:
+    return user.id if user is not None else client_id
+
+
+def _reject_unowned_existing_session(
+    request: ChatRequest,
+    user: CurrentUser | None,
+    container: AppContainer,
+) -> None:
+    if user is None or not request.session_id:
+        return
+    existing = container.session_store.snapshot(request.session_id)
+    if existing is not None and existing.client_id != user.id:
+        raise HTTPException(status_code=404, detail=f"session '{request.session_id}' not found")
 
 
 def _normalize_intent(raw: str) -> IntentType:
@@ -354,7 +375,10 @@ def _to_detail(state: AgentSessionState, *, container: AppContainer) -> ChatSess
 async def chat(
     request: ChatRequest,
     container: AppContainer = Depends(get_container),
+    user: CurrentUser | None = Depends(get_current_user),
 ) -> ChatResponse:
+    _reject_unowned_existing_session(request, user, container)
+    request = _authenticated_request(request, user)
     logger.info(
         "api.chat.request session_id=%s intent=%s page_size=%s message=%s",
         request.session_id or "new",
@@ -393,6 +417,7 @@ async def chat_with_upload(
     page_size: str | None = Form(default=None),
     files: list[UploadFile] = File(default_factory=list),
     container: AppContainer = Depends(get_container),
+    user: CurrentUser | None = Depends(get_current_user),
 ) -> ChatResponse:
     attachments = await _parse_chat_attachments(files)
     request = _request_from_form(
@@ -410,7 +435,7 @@ async def chat_with_upload(
         page_size=page_size,
         attachments=attachments,
     )
-    return await chat(request=request, container=container)
+    return await chat(request=request, container=container, user=user)
 
 
 @router.post(
@@ -421,7 +446,10 @@ async def chat_with_upload(
 async def dispatch_chat_session(
     request: ChatRequest,
     container: AppContainer = Depends(get_container),
+    user: CurrentUser | None = Depends(get_current_user),
 ) -> ChatSessionDispatchDto:
+    _reject_unowned_existing_session(request, user, container)
+    request = _authenticated_request(request, user)
     logger.info(
         "api.chat.dispatch session_id=%s intent=%s page_size=%s message=%s",
         request.session_id or "new",
@@ -467,6 +495,7 @@ async def dispatch_chat_session_with_upload(
     page_size: str | None = Form(default=None),
     files: list[UploadFile] = File(default_factory=list),
     container: AppContainer = Depends(get_container),
+    user: CurrentUser | None = Depends(get_current_user),
 ) -> ChatSessionDispatchDto:
     attachments = await _parse_chat_attachments(files)
     request = _request_from_form(
@@ -484,7 +513,7 @@ async def dispatch_chat_session_with_upload(
         page_size=page_size,
         attachments=attachments,
     )
-    return await dispatch_chat_session(request=request, container=container)
+    return await dispatch_chat_session(request=request, container=container, user=user)
 
 
 @router.get("/chat/sessions", response_model=list[ChatSessionSummaryDto])
@@ -492,8 +521,9 @@ def list_chat_sessions(
     limit: int = Query(default=40, ge=1, le=200),
     client_id: str | None = Query(default=None, min_length=1, max_length=128),
     container: AppContainer = Depends(get_container),
+    user: CurrentUser | None = Depends(get_current_user),
 ) -> list[ChatSessionSummaryDto]:
-    sessions = container.session_store.list_snapshots(limit=limit, client_id=client_id)
+    sessions = container.session_store.list_snapshots(limit=limit, client_id=_owner_scope(client_id, user))
     return [_to_summary(state) for state in sessions if state.turns or state.status == "running"]
 
 
@@ -502,8 +532,12 @@ def get_chat_session(
     session_id: str,
     client_id: str | None = Query(default=None, min_length=1, max_length=128),
     container: AppContainer = Depends(get_container),
+    user: CurrentUser | None = Depends(get_current_user),
 ) -> ChatSessionDetailDto:
-    session = container.session_store.snapshot(session_id, client_id=client_id)
+    owner_scope = _owner_scope(client_id, user)
+    session = container.session_store.snapshot(session_id, client_id=owner_scope)
+    if user is not None and session is not None and session.client_id != user.id:
+        session = None
     if session is None:
         raise HTTPException(status_code=404, detail=f"session '{session_id}' not found")
     return _to_detail(session, container=container)
@@ -514,13 +548,17 @@ def delete_chat_session(
     session_id: str,
     client_id: str | None = Query(default=None, min_length=1, max_length=128),
     container: AppContainer = Depends(get_container),
+    user: CurrentUser | None = Depends(get_current_user),
 ) -> Response:
-    session = container.session_store.snapshot(session_id, client_id=client_id)
+    owner_scope = _owner_scope(client_id, user)
+    session = container.session_store.snapshot(session_id, client_id=owner_scope)
+    if user is not None and session is not None and session.client_id != user.id:
+        session = None
     if session is None:
         raise HTTPException(status_code=404, detail=f"session '{session_id}' not found")
     if container.orchestrator.is_session_running(session_id):
         raise HTTPException(status_code=409, detail=f"session '{session_id}' is currently running")
-    deleted = container.session_store.delete(session_id, client_id=client_id)
+    deleted = container.session_store.delete(session_id, client_id=owner_scope)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"session '{session_id}' not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

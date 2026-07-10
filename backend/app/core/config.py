@@ -85,8 +85,20 @@ class Settings:
     supabase_anon_key: str = ""
     supabase_service_role_key: str = ""
     supabase_timeout_seconds: float = 8.0
+    auth_enabled: bool = False
+    jwt_issuer: str = ""
+    jwt_audience: str = "authenticated"
+    jwt_jwks_url: str = ""
+    jwt_secret: str = ""
+    jwt_algorithms: str = "RS256,ES256"
     chat_session_store_path: Path = Path("data/runtime/chat_sessions.json")
     chat_stream_event_store_path: Path = Path("data/runtime/chat_stream_events.jsonl")
+    knowledge_submission_store_path: Path = Path("data/runtime/knowledge_submissions.json")
+    knowledge_submission_files_path: Path = Path("data/runtime/knowledge_submissions")
+    knowledge_submission_max_bytes: int = 10 * 1024 * 1024
+    knowledge_submission_blocked_keywords: str = "色情,赌博网站,毒品交易,诈骗教程,暴力恐怖"
+    knowledge_submission_reject_images: bool = True
+    knowledge_submission_scan_max_chars: int = 500_000
     replay_buffer_size: int = 200
     sse_keepalive_seconds: float = 1.0
     sse_max_wait_seconds: int = 20
@@ -173,11 +185,50 @@ class Settings:
             supabase_timeout_seconds=float(
                 os.getenv("SUPABASE_TIMEOUT_SECONDS", str(cls.supabase_timeout_seconds))
             ),
+            auth_enabled=_env_bool("AUTH_ENABLED", cls.auth_enabled),
+            jwt_issuer=os.getenv(
+                "JWT_ISSUER",
+                f"{os.getenv('SUPABASE_URL', cls.supabase_url).strip().rstrip('/')}/auth/v1"
+                if os.getenv("SUPABASE_URL", cls.supabase_url).strip()
+                else cls.jwt_issuer,
+            ).strip().rstrip("/"),
+            jwt_audience=os.getenv("JWT_AUDIENCE", cls.jwt_audience).strip(),
+            jwt_jwks_url=os.getenv(
+                "JWT_JWKS_URL",
+                f"{os.getenv('SUPABASE_URL', cls.supabase_url).strip().rstrip('/')}/auth/v1/.well-known/jwks.json"
+                if os.getenv("SUPABASE_URL", cls.supabase_url).strip()
+                else cls.jwt_jwks_url,
+            ).strip(),
+            jwt_secret=os.getenv("JWT_SECRET", cls.jwt_secret).strip(),
+            jwt_algorithms=os.getenv("JWT_ALGORITHMS", cls.jwt_algorithms).strip(),
             chat_session_store_path=_resolve_project_path(
                 os.getenv("CHAT_SESSION_STORE_PATH", str(cls.chat_session_store_path))
             ),
             chat_stream_event_store_path=_resolve_project_path(
                 os.getenv("CHAT_STREAM_EVENT_STORE_PATH", str(cls.chat_stream_event_store_path))
+            ),
+            knowledge_submission_store_path=_resolve_project_path(
+                os.getenv("KNOWLEDGE_SUBMISSION_STORE_PATH", str(cls.knowledge_submission_store_path))
+            ),
+            knowledge_submission_files_path=_resolve_project_path(
+                os.getenv("KNOWLEDGE_SUBMISSION_FILES_PATH", str(cls.knowledge_submission_files_path))
+            ),
+            knowledge_submission_max_bytes=int(
+                os.getenv("KNOWLEDGE_SUBMISSION_MAX_BYTES", str(cls.knowledge_submission_max_bytes))
+            ),
+            knowledge_submission_blocked_keywords=os.getenv(
+                "KNOWLEDGE_SUBMISSION_BLOCKED_KEYWORDS",
+                cls.knowledge_submission_blocked_keywords,
+            ).strip(),
+            knowledge_submission_reject_images=_env_bool(
+                "KNOWLEDGE_SUBMISSION_REJECT_IMAGES",
+                cls.knowledge_submission_reject_images,
+            ),
+            knowledge_submission_scan_max_chars=int(
+                os.getenv(
+                    "KNOWLEDGE_SUBMISSION_SCAN_MAX_CHARS",
+                    str(cls.knowledge_submission_scan_max_chars),
+                )
             ),
             replay_buffer_size=int(os.getenv("REPLAY_BUFFER_SIZE", str(cls.replay_buffer_size))),
             sse_keepalive_seconds=float(

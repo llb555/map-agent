@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from pydantic import BaseModel, Field
 
-from app.api.deps import get_container
+from app.api.deps import get_container, require_admin, require_authenticated_user
+from app.auth.models import CurrentUser
 from app.core.container import AppContainer
 from app.protocol.messages import (
     ArcadeGeoDto,
@@ -31,6 +32,34 @@ class KnowledgeBatchDeleteRequest(BaseModel):
 
 class KnowledgeRetryRequest(BaseModel):
     relative_path: str = Field(..., min_length=1)
+
+
+class KnowledgeSubmissionDto(BaseModel):
+    id: str
+    owner_user_id: str
+    owner_email: str | None
+    original_filename: str
+    suffix: str
+    size_bytes: int
+    sha256: str
+    title: str | None
+    description: str | None
+    status: Literal["pending", "approved", "rejected", "withdrawn"]
+    review_note: str | None
+    reviewed_by: str | None
+    reviewed_at: str | None
+    published_relative_path: str | None
+    created_at: str
+    updated_at: str
+
+
+class KnowledgeSubmissionReviewRequest(BaseModel):
+    decision: Literal["approved", "rejected"]
+    note: str | None = Field(default=None, max_length=1000)
+
+
+def _submission_dto(item: object) -> KnowledgeSubmissionDto:
+    return KnowledgeSubmissionDto.model_validate(item, from_attributes=True)
 
 
 def _build_knowledge_status(container: AppContainer) -> KnowledgeStatusDto:
@@ -245,8 +274,106 @@ def lookup_knowledge(
     )
 
 
+@router.get("/submissions", response_model=list[KnowledgeSubmissionDto])
+def list_knowledge_submissions(
+    container: AppContainer = Depends(get_container),
+    user: CurrentUser = Depends(require_authenticated_user),
+) -> list[KnowledgeSubmissionDto]:
+    owner_scope = None if user.is_admin else user.id
+    return [_submission_dto(item) for item in container.knowledge_submission_store.list(owner_user_id=owner_scope)]
+
+
+@router.post("/submissions", response_model=KnowledgeSubmissionDto, status_code=201)
+async def create_knowledge_submission(
+    file: UploadFile = File(...),
+    title: str | None = Form(default=None, max_length=200),
+    description: str | None = Form(default=None, max_length=2000),
+    container: AppContainer = Depends(get_container),
+    user: CurrentUser = Depends(require_authenticated_user),
+) -> KnowledgeSubmissionDto:
+    filename = Path(file.filename or "").name
+    if not filename:
+        raise HTTPException(status_code=400, detail="knowledge_filename_required")
+    suffix = Path(filename).suffix.lower()
+    if suffix not in set(container.rag_service.supported_suffixes()):
+        raise HTTPException(status_code=400, detail=f"knowledge_suffix_not_supported:{suffix or 'none'}")
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="knowledge_submission_empty")
+    if len(payload) > container.settings.knowledge_submission_max_bytes:
+        raise HTTPException(status_code=413, detail="knowledge_submission_too_large")
+    normalized_title = (title or "").strip() or None
+    normalized_description = (description or "").strip() or None
+    screening = container.knowledge_submission_filter.screen(
+        filename=filename,
+        payload=payload,
+        title=normalized_title,
+        description=normalized_description,
+    )
+    try:
+        item = container.knowledge_submission_store.create(
+            owner_user_id=user.id,
+            owner_email=user.email,
+            filename=filename,
+            payload=payload,
+            title=normalized_title,
+            description=normalized_description,
+            automated_rejection_note=None if screening.accepted else screening.reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _submission_dto(item)
+
+
+@router.delete("/submissions/{submission_id}", status_code=204, response_class=Response)
+def withdraw_knowledge_submission(
+    submission_id: str,
+    container: AppContainer = Depends(get_container),
+    user: CurrentUser = Depends(require_authenticated_user),
+) -> Response:
+    try:
+        item = container.knowledge_submission_store.withdraw(submission_id, owner_user_id=user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if item is None:
+        raise HTTPException(status_code=404, detail="knowledge_submission_not_found")
+    return Response(status_code=204)
+
+
+@router.post("/submissions/{submission_id}/review", response_model=KnowledgeSubmissionDto)
+def review_knowledge_submission(
+    submission_id: str,
+    payload: KnowledgeSubmissionReviewRequest,
+    container: AppContainer = Depends(get_container),
+    user: CurrentUser | None = Depends(require_admin),
+) -> KnowledgeSubmissionDto:
+    if user is None:
+        raise HTTPException(status_code=401, detail="authentication_required")
+    try:
+        item = container.knowledge_submission_store.review(
+            submission_id,
+            reviewer_id=user.id,
+            decision=payload.decision,
+            note=(payload.note or "").strip() or None,
+            published_directory=container.rag_service.knowledge_directory(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if item is None:
+        raise HTTPException(status_code=404, detail="knowledge_submission_not_found")
+    if payload.decision == "approved" and item.published_relative_path:
+        container.rag_service.enqueue_reindex(
+            relative_paths=[item.published_relative_path],
+            kind="submission_approved",
+        )
+    return _submission_dto(item)
+
+
 @router.post("/reindex", response_model=KnowledgeStatusDto)
-def reindex_knowledge(container: AppContainer = Depends(get_container)) -> KnowledgeStatusDto:
+def reindex_knowledge(
+    container: AppContainer = Depends(get_container),
+    _: CurrentUser | None = Depends(require_admin),
+) -> KnowledgeStatusDto:
     try:
         container.rag_service.enqueue_reindex(kind="full_reindex")
     except Exception as exc:
@@ -258,6 +385,7 @@ def reindex_knowledge(container: AppContainer = Depends(get_container)) -> Knowl
 def retry_knowledge_file(
     payload: KnowledgeRetryRequest,
     container: AppContainer = Depends(get_container),
+    _: CurrentUser | None = Depends(require_admin),
 ) -> KnowledgeStatusDto:
     try:
         container.rag_service.retry_failed_file(payload.relative_path.strip())
@@ -270,6 +398,7 @@ def retry_knowledge_file(
 async def upload_knowledge_file(
     file: UploadFile = File(...),
     container: AppContainer = Depends(get_container),
+    _: CurrentUser | None = Depends(require_admin),
 ) -> KnowledgeUploadResponseDto:
     filename = Path(file.filename or "").name
     if not filename:
@@ -319,6 +448,7 @@ async def upload_knowledge_file(
 def delete_knowledge_file(
     relative_path: str = Query(..., min_length=1),
     container: AppContainer = Depends(get_container),
+    _: CurrentUser | None = Depends(require_admin),
 ) -> Response:
     target_dir = _require_knowledge_directory(container)
     target_path = _resolve_knowledge_relative_path(relative_path, target_dir=target_dir)
@@ -345,6 +475,7 @@ def delete_knowledge_file(
 def delete_knowledge_files_batch(
     payload: KnowledgeBatchDeleteRequest,
     container: AppContainer = Depends(get_container),
+    _: CurrentUser | None = Depends(require_admin),
 ) -> KnowledgeStatusDto:
     target_dir = _require_knowledge_directory(container)
     relative_paths = [item.strip() for item in payload.relative_paths if item.strip()]

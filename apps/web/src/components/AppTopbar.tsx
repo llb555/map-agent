@@ -1,7 +1,9 @@
 import { formatTimeLabel } from "../lib/chatStream";
 import { useAppStore } from "../stores/appStore";
+import { getAuthSession, signOut } from "../lib/auth";
 
 export function AppTopbar() {
+  const authSession = getAuthSession();
   const viewMode = useAppStore((state) => state.viewMode);
   const sessions = useAppStore((state) => state.sessions);
   const activeSessionId = useAppStore((state) => state.activeSessionId);
@@ -37,6 +39,13 @@ export function AppTopbar() {
         <p>{subtitle}</p>
       </div>
       <div className="topbar-meta">
+        {authSession ? (
+          <div className="topbar-meta-block topbar-account">
+            <span className="topbar-meta-label">账号</span>
+            <strong>{authSession.user.email || "已认证用户"}</strong>
+            <button type="button" onClick={() => void signOut()}>退出</button>
+          </div>
+        ) : null}
         <div className="topbar-meta-block">
           <span className="topbar-meta-label">模式</span>
           <strong>{viewPill}</strong>

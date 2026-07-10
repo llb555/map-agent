@@ -741,3 +741,70 @@
     background-position: -200% 0;
   }
 }
+
+.knowledge-contribution-band {
+  padding: 20px;
+  display: grid;
+  gap: 16px;
+  border-left: 4px solid #c9892d;
+}
+
+.knowledge-review-count {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 10px;
+  border: 1px solid rgba(201, 137, 45, 0.24);
+  border-radius: 4px;
+  color: #85591e;
+  background: #fff8eb;
+  font-size: 0.8rem;
+}
+
+.knowledge-contribution-form {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.7fr) minmax(220px, 1.3fr) auto;
+  gap: 10px;
+}
+
+.knowledge-contribution-form > input {
+  min-width: 0;
+  min-height: 44px;
+  border: 1px solid rgba(103, 132, 121, 0.24);
+  border-radius: 4px;
+  padding: 0 12px;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--ink);
+}
+
+.knowledge-submission-list { display: grid; gap: 10px; }
+.knowledge-submission-item {
+  min-height: 92px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: center;
+  padding: 14px 16px;
+  border: 1px solid rgba(104, 133, 122, 0.17);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.72);
+}
+.knowledge-submission-item > div:first-child { min-width: 0; display: grid; gap: 5px; }
+.knowledge-submission-item strong,
+.knowledge-submission-item p { overflow-wrap: anywhere; }
+.knowledge-submission-item p { margin: 0; color: var(--muted); font-size: 0.88rem; }
+.knowledge-submission-item small { color: #73847e; }
+.knowledge-submission-status { width: fit-content; padding: 3px 7px; border-radius: 3px; background: #e8ece9; color: #52645e; font-size: 0.72rem; }
+.knowledge-submission-status.is-pending { background: #fff0d7; color: #87591a; }
+.knowledge-submission-status.is-approved { background: #dceee6; color: #1d6b5b; }
+.knowledge-submission-status.is-rejected { background: #f4dfdb; color: #9a4032; }
+.knowledge-submission-actions { display: flex; gap: 8px; }
+.knowledge-submission-actions button { min-height: 36px; padding: 0 12px; border: 1px solid rgba(105, 132, 122, 0.24); border-radius: 4px; background: #fff; cursor: pointer; }
+.knowledge-submission-actions .is-approve { background: #1d6b5b; color: #fff; border-color: #1d6b5b; }
+.knowledge-submission-actions .is-reject { color: #9a4032; border-color: rgba(154, 64, 50, 0.3); }
+.knowledge-review-note { padding: 7px 9px; background: #f4f1e9; border-left: 2px solid #c9892d; }
+
+@media (max-width: 760px) {
+  .knowledge-contribution-form { grid-template-columns: 1fr; }
+  .knowledge-submission-item { grid-template-columns: 1fr; }
+}

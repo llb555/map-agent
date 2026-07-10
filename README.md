@@ -126,6 +126,15 @@ SUPABASE_URL=
 SUPABASE_ANON_KEY=
 SUPABASE_SERVICE_ROLE_KEY=
 SUPABASE_TIMEOUT_SECONDS=8
+
+# Supabase Auth / JWT（默认关闭，配置完成后再开启）
+AUTH_ENABLED=false
+JWT_ISSUER=https://YOUR_PROJECT_REF.supabase.co/auth/v1
+JWT_AUDIENCE=authenticated
+JWT_JWKS_URL=https://YOUR_PROJECT_REF.supabase.co/auth/v1/.well-known/jwks.json
+JWT_ALGORITHMS=RS256,ES256
+# 仅旧版 HS256 项目需要；推荐使用上面的 JWKS
+JWT_SECRET=
 CHAT_SESSION_STORE_PATH=data/runtime/chat_sessions.json
 CHAT_STREAM_EVENT_STORE_PATH=data/runtime/chat_stream_events.jsonl
 
@@ -269,12 +278,89 @@ Copy-Item apps/web/.env.example apps/web/.env.local
 
 ```dotenv
 VITE_API_BASE=http://127.0.0.1:8000
+VITE_SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+VITE_SUPABASE_ANON_KEY=
 VITE_AMAP_WEB_KEY=
 VITE_AMAP_SECURITY_JS_CODE=
 VITE_AMAP_URI_SRC=arcadegent_web
 ```
 
 注意：`VITE_AMAP_WEB_KEY` 必须是高德 Web JS API 可用的浏览器 key，不能直接复用只给 REST / MCP 用的 key，否则页面会报 `USERKEY_PLAT_NOMATCH` 或类似鉴权错误。
+
+### JWT 登录配置
+
+项目使用 Supabase Auth 签发 Access Token，FastAPI 通过 Supabase JWKS 验证 JWT。无需在本机额外安装数据库。
+
+1. 在 Supabase 控制台开启 Email 登录；根据需要决定是否要求邮箱确认。
+2. 将项目 URL 和 anon key 同时配置到 `SUPABASE_*` 与 `VITE_SUPABASE_*`。
+3. 确认 JWKS 地址可访问后，将 `AUTH_ENABLED` 改为 `true`。
+4. 重新启动后端并重新构建前端。只配置 `VITE_SUPABASE_*` 会显示登录页，但后端不会启用保护；生产环境必须同时开启 `AUTH_ENABLED=true`。
+
+开启后，聊天和 SSE 接口必须携带 `Authorization: Bearer <token>`，会话归属以 JWT 的 `sub` 为准，客户端提交的 `client_id` 不参与授权。知识库读取仍可用，但上传、删除、重建索引要求 JWT 中的 `app_metadata.role` 为 `admin`。
+
+管理员角色应通过可信后端或 Supabase 管理接口写入 `app_metadata`，不要使用用户可自行修改的 `user_metadata`。旧版 Supabase 项目如果只提供 HS256 secret，可设置 `JWT_SECRET` 和 `JWT_ALGORITHMS=HS256`；新项目优先使用 JWKS。
+
+#### 设置和修改用户角色
+
+用户必须先在 Arcadegent 完成注册，使账号出现在 Supabase 的 `auth.users` 表中。然后进入 Supabase Dashboard 对应项目的 **SQL Editor**，通过邮箱将普通用户提升为管理员：
+
+```sql
+update auth.users
+set raw_app_meta_data =
+  coalesce(raw_app_meta_data, '{}'::jsonb)
+  || '{"role":"admin"}'::jsonb
+where email = 'admin@example.com'
+returning id, email, raw_app_meta_data;
+```
+
+将管理员恢复为普通用户：
+
+```sql
+update auth.users
+set raw_app_meta_data =
+  coalesce(raw_app_meta_data, '{}'::jsonb)
+  || '{"role":"user"}'::jsonb
+where email = 'user@example.com'
+returning id, email, raw_app_meta_data;
+```
+
+查询并确认当前角色：
+
+```sql
+select id, email, raw_app_meta_data
+from auth.users
+where email = 'admin@example.com';
+```
+
+角色修改后，用户必须在 Arcadegent 中退出并重新登录，Supabase 才会签发包含新 `app_metadata.role` 的 JWT。未设置角色的账号默认按 `user` 处理。
+
+权限规则如下：
+
+- `user`：使用聊天和个人会话、查看正式知识库、提交文档、查看和撤回自己的待审核投稿。
+- `admin`：拥有普通用户能力，并可审核全部投稿、直接维护正式知识库、删除文档和重建索引。
+- 角色必须保存在 `raw_app_meta_data`（JWT 中对应 `app_metadata`），不能保存在用户可修改的 `raw_user_meta_data`。
+- 不要在浏览器端使用 `service_role key` 修改角色；该密钥只能保存在可信后端或安全的管理环境中。
+
+### 知识文档投稿与审核
+
+登录用户可以在知识库页面提交受支持的文档并查看自己的投稿记录。投稿首先保存在独立审核区，不会被 RAG 检索；用户可以撤回仍处于 `pending` 的投稿。管理员能查看全部投稿并进行通过或驳回，只有通过后的文件才会复制到正式知识目录并触发增量索引。
+
+本地文件模式使用以下配置，默认值可直接用于单机部署：
+
+```env
+KNOWLEDGE_SUBMISSION_STORE_PATH=data/runtime/knowledge_submissions.json
+KNOWLEDGE_SUBMISSION_FILES_PATH=data/runtime/knowledge_submissions
+KNOWLEDGE_SUBMISSION_MAX_BYTES=10485760
+KNOWLEDGE_SUBMISSION_BLOCKED_KEYWORDS=色情,赌博网站,毒品交易,诈骗教程,暴力恐怖
+KNOWLEDGE_SUBMISSION_REJECT_IMAGES=true
+KNOWLEDGE_SUBMISSION_SCAN_MAX_CHARS=500000
+```
+
+投稿状态包括 `pending`、`approved`、`rejected`、`withdrawn`。审核接口要求 `app_metadata.role=admin`；投稿列表对普通用户自动按 JWT `sub` 隔离，管理员可以查看全部记录。
+
+投稿进入人工审核前会先执行自动内容筛选：文件名、投稿标题、说明和正文都会扫描 `KNOWLEDGE_SUBMISSION_BLOCKED_KEYWORDS` 中以逗号分隔的关键词，匹配忽略大小写；命中后投稿直接标记为 `rejected`，原文件不会保存。启用 `KNOWLEDGE_SUBMISSION_REJECT_IMAGES=true` 时，包含嵌入图片的 PDF 或 DOCX 同样会自动驳回。损坏、无法可靠解析的文件以及旧版 `.doc` 会按失败关闭原则自动驳回，避免绕过扫描。自动驳回原因会写入投稿的审核意见，供投稿者和管理员查看。
+
+关键词规则应根据实际运营要求维护；不要把该机制视为完整的恶意软件或违法内容检测。生产环境还应在文件存储入口增加病毒扫描、上传频率限制，并对自动驳回记录进行人工抽查。
 
 启动：
 

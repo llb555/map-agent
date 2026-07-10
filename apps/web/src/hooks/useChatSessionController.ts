@@ -1,11 +1,11 @@
 import { FormEvent, useCallback, useEffect, useRef } from "react";
 import {
-  buildChatStreamUrl,
   deleteChatSession,
   dispatchChatSessionWithUploads,
   dispatchChatSession,
   getChatSession,
-  listChatSessions
+  listChatSessions,
+  streamChatSession
 } from "../api/client";
 import { resolveClientLocationForSessionStart, warmupClientLocationCache } from "../lib/clientLocation";
 import { canDispatchChat, chatLifecycleFromSessionStatus } from "../lib/chatLifecycle";
@@ -16,7 +16,7 @@ import {
   writeStoredStreamOffset,
   writeStoredActiveSessionId
 } from "../lib/chatSessionStorage";
-import { parseChatStreamEnvelope, STREAM_EVENT_NAMES, toProgressText, toVisibleTurns } from "../lib/chatStream";
+import { parseChatStreamEnvelope, toProgressText, toVisibleTurns } from "../lib/chatStream";
 import { mapArtifactsFromSessionDetail } from "../lib/mapArtifacts";
 import { useAppStore } from "../stores/appStore";
 import type {
@@ -78,7 +78,7 @@ export function useChatSessionController() {
     writeStreamReplyTarget
   } = useStreamReply();
 
-  const streamRef = useRef<EventSource | null>(null);
+  const streamRef = useRef<AbortController | null>(null);
   const clientIdRef = useRef("");
   const streamOffsetsRef = useRef<Record<string, number>>(readStoredStreamOffsets());
   if (!clientIdRef.current) {
@@ -87,7 +87,7 @@ export function useChatSessionController() {
 
   const stopStream = useCallback(() => {
     if (streamRef.current) {
-      streamRef.current.close();
+      streamRef.current.abort();
       streamRef.current = null;
     }
   }, []);
@@ -180,15 +180,14 @@ export function useChatSessionController() {
     resetStreamReply();
 
     const resumeOffset = typeof lastEventId === "number" ? lastEventId : streamOffsetsRef.current[sessionId];
-    const source = new EventSource(buildChatStreamUrl(sessionId, resumeOffset, clientIdRef.current));
+    const source = new AbortController();
     streamRef.current = source;
 
-    const handleEvent = (raw: Event) => {
+    const handleEvent = (message: { data: string }) => {
       if (streamRef.current !== source) {
         return;
       }
 
-      const message = raw as MessageEvent<string>;
       if (!message.data) {
         return;
       }
@@ -278,34 +277,38 @@ export function useChatSessionController() {
       }
     };
 
-    source.onopen = () => {
-      if (streamRef.current !== source) {
-        return;
-      }
+    if (streamRef.current === source) {
       const currentStore = useAppStore.getState();
       currentStore.setActiveSessionStatus("running");
       currentStore.transitionChatLifecycle("stream.open");
-    };
+    }
 
-    source.onerror = () => {
+    void streamChatSession(
+      sessionId,
+      resumeOffset,
+      clientIdRef.current,
+      source.signal,
+      handleEvent
+    ).then(() => {
+      if (streamRef.current !== source) return;
+      stopStream();
+      void loadSession(sessionId, { preserveStreamState: true, reconnectStream: false });
+    }).catch((error) => {
       if (streamRef.current !== source) {
+        return;
+      }
+      if (error instanceof DOMException && error.name === "AbortError") {
         return;
       }
       const store = useAppStore.getState();
       if (store.chatLifecycle === "streaming") {
         store.transitionChatLifecycle("stream.reconnect");
       }
-      if (source.readyState === EventSource.CLOSED) {
-        stopStream();
-        void loadSession(sessionId, {
-          preserveStreamState: true,
-          reconnectStream: false
-        });
-      }
-    };
-
-    STREAM_EVENT_NAMES.forEach((eventName) => {
-      source.addEventListener(eventName, handleEvent as EventListener);
+      stopStream();
+      void loadSession(sessionId, {
+        preserveStreamState: true,
+        reconnectStream: false
+      });
     });
   }
 

@@ -9,7 +9,8 @@ from collections.abc import AsyncIterator
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.api.deps import get_container
+from app.api.deps import get_container, get_current_user
+from app.auth.models import CurrentUser
 from app.core.container import AppContainer
 
 router = APIRouter(tags=["stream"])
@@ -28,8 +29,13 @@ async def stream(
     last_event_id: int | None = Query(default=None),
     last_event_id_header: str | None = Header(default=None, alias="Last-Event-ID"),
     container: AppContainer = Depends(get_container),
+    user: CurrentUser | None = Depends(get_current_user),
 ) -> StreamingResponse:
-    if client_id is not None and container.session_store.snapshot(session_id, client_id=client_id) is None:
+    owner_scope = user.id if user is not None else client_id
+    initial_snapshot = container.session_store.snapshot(session_id, client_id=owner_scope)
+    if owner_scope is not None and (
+        initial_snapshot is None or (user is not None and initial_snapshot.client_id != user.id)
+    ):
         raise HTTPException(status_code=404, detail=f"session '{session_id}' not found")
 
     async def iterator() -> AsyncIterator[str]:
@@ -56,7 +62,7 @@ async def stream(
                         return
                 waited = 0
             else:
-                snapshot = container.session_store.snapshot(session_id, client_id=client_id)
+                snapshot = container.session_store.snapshot(session_id, client_id=owner_scope)
                 session_status = snapshot.status if snapshot is not None else None
                 if session_status in {"completed", "failed"}:
                     return

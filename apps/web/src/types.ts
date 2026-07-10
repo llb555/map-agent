@@ -272,6 +272,31 @@ export type KnowledgeUploadResponse = Omit<KnowledgeUploadResponseDto, "file" | 
   rag: KnowledgeStatus;
 };
 
+export type CurrentUser = {
+  id: string;
+  email: string | null;
+  role: "anonymous" | "user" | "contributor" | "admin";
+};
+
+export type KnowledgeSubmission = {
+  id: string;
+  owner_user_id: string;
+  owner_email: string | null;
+  original_filename: string;
+  suffix: string;
+  size_bytes: number;
+  sha256: string;
+  title: string | null;
+  description: string | null;
+  status: "pending" | "approved" | "rejected" | "withdrawn";
+  review_note: string | null;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  published_relative_path: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type KnowledgeLookupHit = KnowledgeLookupHitDto;
 
 export type KnowledgeArcadeCandidate = Omit<KnowledgeArcadeCandidateDto, "geo"> & {

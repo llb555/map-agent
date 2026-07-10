@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import sys
 import time
 from pathlib import Path
+from zipfile import ZipFile
 
+import jwt
 from fastapi.testclient import TestClient
 
 
@@ -85,6 +88,19 @@ def _clear_rag_env() -> None:
         os.environ.pop(name, None)
 
 
+def _clear_auth_env() -> None:
+    for name in (
+        "AUTH_ENABLED",
+        "JWT_ISSUER",
+        "JWT_AUDIENCE",
+        "JWT_JWKS_URL",
+        "JWT_SECRET",
+        "JWT_ALGORITHMS",
+    ):
+        os.environ.pop(name, None)
+    os.environ["AUTH_ENABLED"] = "false"
+
+
 def _build_client(
     tmp_path: Path,
     *,
@@ -92,6 +108,7 @@ def _build_client(
     mcp_servers_dir: Path | None = None,
     cache_path: Path | None = None,
     rag_env: dict[str, str] | None = None,
+    auth_env: dict[str, str] | None = None,
 ) -> TestClient:
     data_path = tmp_path / "shops.jsonl"
     empty_mcp_dir = tmp_path / "mcp_empty"
@@ -100,6 +117,7 @@ def _build_client(
     _clear_mcp_env()
     _clear_llm_env()
     _clear_rag_env()
+    _clear_auth_env()
     os.environ["ARCADE_DATA_JSONL"] = str(data_path)
     os.environ["ARCADE_DATA_SOURCE"] = "jsonl"
     os.environ["CHAT_SESSION_STORE_PATH"] = str(session_store_path or (tmp_path / "chat_sessions.json"))
@@ -111,8 +129,12 @@ def _build_client(
     os.environ["MCP_SERVERS_DIR"] = str(mcp_servers_dir or empty_mcp_dir)
     os.environ["RAG_ENABLED"] = "false"
     os.environ["RAG_SNAPSHOT_PATH"] = str(tmp_path / "rag_snapshot.json")
+    os.environ["KNOWLEDGE_SUBMISSION_STORE_PATH"] = str(tmp_path / "knowledge_submissions.json")
+    os.environ["KNOWLEDGE_SUBMISSION_FILES_PATH"] = str(tmp_path / "knowledge_submission_files")
     if rag_env:
         os.environ.update(rag_env)
+    if auth_env:
+        os.environ.update(auth_env)
 
     from app.main import create_app
 
@@ -139,6 +161,7 @@ def _build_client_with_rows(
     _clear_mcp_env()
     _clear_llm_env()
     _clear_rag_env()
+    _clear_auth_env()
     os.environ["ARCADE_DATA_JSONL"] = str(data_path)
     os.environ["ARCADE_DATA_SOURCE"] = "jsonl"
     os.environ["CHAT_SESSION_STORE_PATH"] = str(session_store_path or (tmp_path / "chat_sessions.json"))
@@ -196,6 +219,37 @@ def _wait_for_knowledge_ready(client: TestClient, *, timeout_seconds: float = 3.
                     return payload
         time.sleep(0.05)
     raise AssertionError(f"knowledge index did not become idle, last_payload={last_payload}")
+
+
+def _auth_token(user_id: str, *, role: str = "user") -> str:
+    now = int(time.time())
+    return jwt.encode(
+        {
+            "sub": user_id,
+            "email": f"{user_id}@example.com",
+            "iat": now,
+            "exp": now + 600,
+            "iss": "https://auth.example.test/auth/v1",
+            "aud": "authenticated",
+            "app_metadata": {"role": role},
+        },
+        "test-jwt-secret-with-at-least-thirty-two-bytes",
+        algorithm="HS256",
+    )
+
+
+def _auth_headers(user_id: str, *, role: str = "user") -> dict[str, str]:
+    return {"Authorization": f"Bearer {_auth_token(user_id, role=role)}"}
+
+
+def _test_auth_env() -> dict[str, str]:
+    return {
+        "AUTH_ENABLED": "true",
+        "JWT_ISSUER": "https://auth.example.test/auth/v1",
+        "JWT_AUDIENCE": "authenticated",
+        "JWT_SECRET": "test-jwt-secret-with-at-least-thirty-two-bytes",
+        "JWT_ALGORITHMS": "HS256",
+    }
 
 
 def test_health_arcades_and_chat(tmp_path: Path) -> None:
@@ -1038,3 +1092,181 @@ def test_arcades_api_supports_distance_sorting(tmp_path: Path) -> None:
     assert payload["total"] == 2
     assert [row["source_id"] for row in payload["items"]] == [10, 11]
     assert payload["items"][0]["distance_m"] == 0
+
+
+def test_jwt_auth_scopes_chat_sessions_to_token_subject(tmp_path: Path) -> None:
+    client = _build_client(tmp_path, auth_env=_test_auth_env())
+    assert client.get("/api/chat/sessions").status_code == 401
+
+    created = client.post(
+        "/api/chat",
+        headers=_auth_headers("user-a"),
+        json={"client_id": "spoofed-user", "message": "find Gamma", "page_size": 3},
+    )
+    assert created.status_code == 200
+    session_id = created.json()["session_id"]
+
+    owner = client.get(f"/api/chat/sessions/{session_id}", headers=_auth_headers("user-a"))
+    assert owner.status_code == 200
+    other = client.get(f"/api/chat/sessions/{session_id}", headers=_auth_headers("user-b"))
+    assert other.status_code == 404
+
+    me = client.get("/api/auth/me", headers=_auth_headers("user-a"))
+    assert me.status_code == 200
+    assert me.json() == {"id": "user-a", "email": "user-a@example.com", "role": "user"}
+
+
+def test_jwt_user_cannot_claim_legacy_anonymous_session(tmp_path: Path) -> None:
+    session_store_path = tmp_path / "legacy_sessions.json"
+    anonymous = _build_client(tmp_path, session_store_path=session_store_path)
+    created = anonymous.post("/api/chat", json={"message": "find Gamma"})
+    assert created.status_code == 200
+    session_id = created.json()["session_id"]
+    anonymous.close()
+
+    authenticated = _build_client(
+        tmp_path,
+        session_store_path=session_store_path,
+        auth_env=_test_auth_env(),
+    )
+    read = authenticated.get(f"/api/chat/sessions/{session_id}", headers=_auth_headers("user-a"))
+    assert read.status_code == 404
+    continue_chat = authenticated.post(
+        "/api/chat",
+        headers=_auth_headers("user-a"),
+        json={"session_id": session_id, "message": "continue"},
+    )
+    assert continue_chat.status_code == 404
+    delete = authenticated.delete(f"/api/chat/sessions/{session_id}", headers=_auth_headers("user-a"))
+    assert delete.status_code == 404
+
+
+def test_jwt_rejects_invalid_token_and_limits_knowledge_writes_to_admin(tmp_path: Path) -> None:
+    client = _build_client(tmp_path, auth_env=_test_auth_env())
+    invalid = client.get("/api/chat/sessions", headers={"Authorization": "Bearer invalid"})
+    assert invalid.status_code == 401
+
+    user_reindex = client.post("/api/knowledge/reindex", headers=_auth_headers("user-a"))
+    assert user_reindex.status_code == 403
+    admin_reindex = client.post(
+        "/api/knowledge/reindex",
+        headers=_auth_headers("admin-a", role="admin"),
+    )
+    assert admin_reindex.status_code == 200
+
+
+def test_knowledge_submission_review_and_publish_flow(tmp_path: Path) -> None:
+    knowledge_dir = tmp_path / "knowledge"
+    knowledge_dir.mkdir()
+    client = _build_client(
+        tmp_path,
+        auth_env=_test_auth_env(),
+        rag_env={"RAG_SOURCE_PATH": str(knowledge_dir), "RAG_ENABLED": "false"},
+    )
+
+    submitted = client.post(
+        "/api/knowledge/submissions",
+        headers=_auth_headers("user-a"),
+        data={"title": "Gamma guide", "description": "Community-maintained location notes"},
+        files={"file": ("gamma.md", b"# Gamma\nUseful arcade notes", "text/markdown")},
+    )
+    assert submitted.status_code == 201
+    item = submitted.json()
+    assert item["status"] == "pending"
+    assert not (knowledge_dir / "gamma.md").exists()
+
+    own_list = client.get("/api/knowledge/submissions", headers=_auth_headers("user-a"))
+    assert own_list.status_code == 200
+    assert [row["id"] for row in own_list.json()] == [item["id"]]
+    other_list = client.get("/api/knowledge/submissions", headers=_auth_headers("user-b"))
+    assert other_list.status_code == 200
+    assert other_list.json() == []
+
+    forbidden = client.post(
+        f"/api/knowledge/submissions/{item['id']}/review",
+        headers=_auth_headers("user-a"),
+        json={"decision": "approved"},
+    )
+    assert forbidden.status_code == 403
+
+    approved = client.post(
+        f"/api/knowledge/submissions/{item['id']}/review",
+        headers=_auth_headers("admin-a", role="admin"),
+        json={"decision": "approved", "note": "Source checked"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
+    assert approved.json()["published_relative_path"] == "gamma.md"
+    assert (knowledge_dir / "gamma.md").read_bytes() == b"# Gamma\nUseful arcade notes"
+
+
+def test_knowledge_submission_can_be_withdrawn_only_by_owner(tmp_path: Path) -> None:
+    client = _build_client(tmp_path, auth_env=_test_auth_env())
+    submitted = client.post(
+        "/api/knowledge/submissions",
+        headers=_auth_headers("user-a"),
+        files={"file": ("notes.txt", b"some notes", "text/plain")},
+    )
+    assert submitted.status_code == 201
+    submission_id = submitted.json()["id"]
+
+    other = client.delete(
+        f"/api/knowledge/submissions/{submission_id}",
+        headers=_auth_headers("user-b"),
+    )
+    assert other.status_code == 404
+    owner = client.delete(
+        f"/api/knowledge/submissions/{submission_id}",
+        headers=_auth_headers("user-a"),
+    )
+    assert owner.status_code == 204
+    listed = client.get("/api/knowledge/submissions", headers=_auth_headers("user-a")).json()
+    assert listed[0]["status"] == "withdrawn"
+
+
+def test_knowledge_submission_filter_auto_rejects_blocked_keyword_without_saving_file(tmp_path: Path) -> None:
+    client = _build_client(
+        tmp_path,
+        auth_env=_test_auth_env(),
+    )
+    submitted = client.post(
+        "/api/knowledge/submissions",
+        headers=_auth_headers("user-a"),
+        data={"title": "Location guide"},
+        files={"file": ("unsafe.md", "这里包含诈骗教程内容".encode(), "text/markdown")},
+    )
+    assert submitted.status_code == 201
+    item = submitted.json()
+    assert item["status"] == "rejected"
+    assert "诈骗教程" in item["review_note"]
+    assert item["reviewed_by"] == "system:content_filter"
+    submission_files = tmp_path / "knowledge_submission_files"
+    assert not submission_files.exists() or not any(submission_files.iterdir())
+
+
+def test_knowledge_submission_filter_scans_metadata_and_docx_images(tmp_path: Path) -> None:
+    client = _build_client(tmp_path, auth_env=_test_auth_env())
+    metadata_rejected = client.post(
+        "/api/knowledge/submissions",
+        headers=_auth_headers("user-a"),
+        data={"description": "赌博网站推广"},
+        files={"file": ("plain.txt", b"safe text", "text/plain")},
+    )
+    assert metadata_rejected.status_code == 201
+    assert metadata_rejected.json()["status"] == "rejected"
+
+    payload = io.BytesIO()
+    with ZipFile(payload, "w") as archive:
+        archive.writestr(
+            "word/document.xml",
+            '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>safe</w:t></w:r></w:p></w:body></w:document>',
+        )
+        archive.writestr("word/media/image1.png", b"not-a-real-image")
+    image_rejected = client.post(
+        "/api/knowledge/submissions",
+        headers=_auth_headers("user-a"),
+        files={"file": ("with-image.docx", payload.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+    )
+    assert image_rejected.status_code == 201
+    assert image_rejected.json()["status"] == "rejected"
+    assert "包含图片" in image_rejected.json()["review_note"]

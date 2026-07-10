@@ -106,6 +106,13 @@ export type Body_chat_with_upload_api_chat_upload_post = {
   [key: string]: unknown;
 };
 
+export type Body_create_knowledge_submission_api_knowledge_submissions_post = {
+  file: string;
+  title?: string | null;
+  description?: string | null;
+  [key: string]: unknown;
+};
+
 export type Body_dispatch_chat_session_with_upload_api_chat_sessions_upload_post = {
   session_id?: string | null;
   client_id?: string | null;
@@ -326,6 +333,32 @@ export type KnowledgeStatusDto = {
   active_job_id?: string | null;
   load_error?: string | null;
   files?: Array<KnowledgeFileItemDto>;
+  [key: string]: unknown;
+};
+
+export type KnowledgeSubmissionDto = {
+  id: string;
+  owner_user_id: string;
+  owner_email: string | null;
+  original_filename: string;
+  suffix: string;
+  size_bytes: number;
+  sha256: string;
+  title: string | null;
+  description: string | null;
+  status: "pending" | "approved" | "rejected" | "withdrawn";
+  review_note: string | null;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  published_relative_path: string | null;
+  created_at: string;
+  updated_at: string;
+  [key: string]: unknown;
+};
+
+export type KnowledgeSubmissionReviewRequest = {
+  decision: "approved" | "rejected";
+  note?: string | null;
   [key: string]: unknown;
 };
 
