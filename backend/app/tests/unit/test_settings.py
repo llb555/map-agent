@@ -80,8 +80,64 @@ def test_settings_defaults_include_extended_agent_step_budget(monkeypatch) -> No
     assert Settings.agent_max_steps >= 8
 
 
+def test_settings_reads_huggingface_runtime_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("HF_TOKEN", "hf-private-token")
+    monkeypatch.setenv("HUGGINGFACE_CACHE_DIR", "data/test-huggingface")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "true")
+    monkeypatch.setenv("HUGGINGFACE_DEVICE", "cpu")
+    monkeypatch.setenv("HUGGINGFACE_TRUST_REMOTE_CODE", "false")
+    monkeypatch.setenv("HUGGINGFACE_REVISION", "model-revision")
+
+    settings = Settings.from_env()
+
+    assert settings.huggingface_token == "hf-private-token"
+    assert settings.huggingface_cache_dir.name == "test-huggingface"
+    assert settings.huggingface_offline is True
+    assert settings.huggingface_device == "cpu"
+    assert settings.huggingface_trust_remote_code is False
+    assert settings.huggingface_revision == "model-revision"
+
+
+def test_settings_uses_hf_home_when_project_cache_is_not_set(monkeypatch) -> None:
+    # Empty explicit value lets HF_HOME win even when the project .env defines a default.
+    monkeypatch.setenv("HUGGINGFACE_CACHE_DIR", "")
+    monkeypatch.setenv("HF_HOME", "data/hf-home")
+
+    settings = Settings.from_env()
+
+    assert settings.huggingface_cache_dir.name == "hf-home"
+
+
 def test_settings_rejects_unknown_arcade_data_source(monkeypatch) -> None:
     monkeypatch.setenv("ARCADE_DATA_SOURCE", "sqlite")
 
     with pytest.raises(ValueError, match="invalid_arcade_data_source:sqlite"):
         Settings.from_env()
+
+
+def test_settings_requires_auth_in_production(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("AUTH_ENABLED", "false")
+
+    with pytest.raises(ValueError, match="production_requires_auth_enabled"):
+        Settings.from_env()
+
+
+def test_settings_rejects_incomplete_auth_configuration(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("JWT_ISSUER", "")
+    monkeypatch.setenv("JWT_AUDIENCE", "")
+    monkeypatch.setenv("JWT_ALGORITHMS", "")
+    monkeypatch.setenv("JWT_JWKS_URL", "")
+    monkeypatch.setenv("JWT_SECRET", "")
+    monkeypatch.setenv("SUPABASE_URL", "")
+
+    with pytest.raises(ValueError, match="incomplete_auth_configuration") as exc_info:
+        Settings.from_env()
+
+    message = str(exc_info.value)
+    assert "JWT_ISSUER" in message
+    assert "JWT_AUDIENCE" in message
+    assert "JWT_ALGORITHMS" in message
+    assert "JWT_SECRET_OR_JWT_JWKS_URL" in message

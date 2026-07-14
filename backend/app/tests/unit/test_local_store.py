@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from app.infra.db.local_store import LocalArcadeStore
 
 
@@ -381,3 +383,48 @@ def test_sort_by_distance_adds_distance_and_keeps_unmapped_rows_last(tmp_path: P
         origin_coord_system="wgs84",
     )
     assert [row["source_id"] for row in farthest] == [2, 1, 3]
+
+def test_add_knowledge_shop_persists_and_refreshes_search(tmp_path: Path) -> None:
+    data_path = tmp_path / "arcades.jsonl"
+    data_path.write_text(
+        json.dumps({
+            "source": "seed", "source_id": 1, "source_url": "seed://1", "name": "Seed Arcade",
+            "address": "上海市", "city_name": "上海市", "arcades": [],
+        }, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    store = LocalArcadeStore.from_jsonl(data_path)
+
+    created = store.add_knowledge_shop({
+        "name": "南京知识机厅",
+        "address": "南京市玄武区测试路 1 号",
+        "city_name": "南京市",
+        "longitude_gcj02": 118.8,
+        "latitude_gcj02": 32.06,
+        "source_url": "knowledge://nanjing",
+    })
+
+    rows, total = store.list_shops(
+        keyword=None, shop_name="南京知识机厅", title_name=None,
+        province_code=None, city_code=None, county_code=None, has_arcades=None,
+        page=1, page_size=10,
+    )
+    assert created["source_id"] == 2
+    assert total == 1
+    assert rows[0]["longitude_gcj02"] == 118.8
+    assert len(data_path.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_add_knowledge_shop_rejects_duplicate_name(tmp_path: Path) -> None:
+    data_path = tmp_path / "arcades.jsonl"
+    data_path.write_text(
+        json.dumps({
+            "source": "seed", "source_id": 1, "source_url": "seed://1", "name": "重复机厅",
+            "address": "上海市", "arcades": [],
+        }, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    store = LocalArcadeStore.from_jsonl(data_path)
+
+    with pytest.raises(ValueError, match="arcade_duplicate:1"):
+        store.add_knowledge_shop({"name": "重复机厅", "address": "另一个地址"})

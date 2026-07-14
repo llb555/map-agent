@@ -5,6 +5,8 @@ import {
   getCurrentUser,
   getKnowledgeStatus,
   listKnowledgeSubmissions,
+  lookupKnowledge,
+  promoteKnowledgeArcadeCandidate,
   reindexKnowledge,
   reviewKnowledgeSubmission,
   retryKnowledgeFile,
@@ -12,7 +14,7 @@ import {
   uploadKnowledgeFile,
   withdrawKnowledgeSubmission
 } from "../api/client";
-import type { CurrentUser, KnowledgeFileItem, KnowledgeStatus, KnowledgeSubmission } from "../types";
+import type { CurrentUser, KnowledgeArcadeCandidate, KnowledgeFileItem, KnowledgeStatus, KnowledgeSubmission } from "../types";
 
 function formatSize(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -54,6 +56,10 @@ export function KnowledgeManager() {
   const [selectedPaths, setSelectedPaths] = useState<string[]>([]);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [candidateQuery, setCandidateQuery] = useState("");
+  const [candidateResults, setCandidateResults] = useState<KnowledgeArcadeCandidate[]>([]);
+  const [candidateSearching, setCandidateSearching] = useState(false);
+  const [promotingId, setPromotingId] = useState("");
 
   async function loadStatus() {
     setLoading(true);
@@ -119,6 +125,39 @@ export function KnowledgeManager() {
       setError(err instanceof Error ? err.message : "审核失败");
     } finally {
       setReviewingId("");
+    }
+  }
+
+  async function handleCandidateSearch() {
+    const query = candidateQuery.trim();
+    if (!query) return;
+    setCandidateSearching(true);
+    setError("");
+    setMessage("");
+    try {
+      const result = await lookupKnowledge(query, 5);
+      setCandidateResults(result.arcade_candidates);
+      if (!result.arcade_candidates.length) setMessage("没有识别到可入库的机厅候选，请检查文档字段与检索词。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "检索知识库候选失败");
+    } finally {
+      setCandidateSearching(false);
+    }
+  }
+
+  async function handlePromoteCandidate(candidate: KnowledgeArcadeCandidate) {
+    if (!window.confirm(`确认将“${candidate.name}”加入正式机厅库？`)) return;
+    setPromotingId(candidate.id);
+    setError("");
+    setMessage("");
+    try {
+      const created = await promoteKnowledgeArcadeCandidate(candidate);
+      setCandidateResults((rows) => rows.filter((row) => row.id !== candidate.id));
+      setMessage(`${created.name} 已加入机厅库，source_id=${created.source_id}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "加入机厅库失败");
+    } finally {
+      setPromotingId("");
     }
   }
 
@@ -533,6 +572,46 @@ export function KnowledgeManager() {
           </div>
         </div>
       </div>
+
+      {isAdmin ? (
+        <div className="knowledge-panel knowledge-candidate-workbench browser-card">
+          <div className="knowledge-section-head">
+            <div className="knowledge-head-copy">
+              <strong>机厅候选入库</strong>
+              <small>从已索引知识中识别候选，核对位置与来源后加入正式机厅检索。</small>
+            </div>
+          </div>
+          <div className="knowledge-candidate-search">
+            <input
+              value={candidateQuery}
+              onChange={(event) => setCandidateQuery(event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") void handleCandidateSearch(); }}
+              placeholder="输入机厅名、地址或城市"
+            />
+            <button type="button" className="browser-primary-btn" onClick={() => void handleCandidateSearch()} disabled={candidateSearching || !candidateQuery.trim()}>
+              {candidateSearching ? "识别中..." : "识别候选"}
+            </button>
+          </div>
+          <div className="knowledge-candidate-list">
+            {candidateResults.map((candidate) => {
+              const point = candidate.geo?.gcj02;
+              return (
+                <article key={candidate.id} className="knowledge-candidate-item">
+                  <div>
+                    <strong>{candidate.name}</strong>
+                    <p>{candidate.address || candidate.region_text || "地址待补充"}</p>
+                    <small>{point ? `GCJ-02 ${point.lng.toFixed(6)}, ${point.lat.toFixed(6)}` : "坐标将按地址补全"}</small>
+                    <small>{candidate.source_uri || "知识库来源"}</small>
+                  </div>
+                  <button type="button" className="browser-primary-btn" onClick={() => void handlePromoteCandidate(candidate)} disabled={promotingId === candidate.id}>
+                    {promotingId === candidate.id ? "写入中..." : "加入机厅库"}
+                  </button>
+                </article>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }

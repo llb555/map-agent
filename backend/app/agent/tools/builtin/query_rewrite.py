@@ -298,6 +298,14 @@ def _build_keyword(
     if title_name:
         sanitized = _strip_title_aliases(sanitized, title_name)
     sanitized = _strip_region_text(sanitized, province_name=province_name, city_name=city_name, county_name=county_name)
+    # Ranking/question language describes how to sort, not what shop text must match.
+    sanitized = re.sub(
+        r"(?:最多|最少|最大|最小|最高|最低)?(?:机台|机器|机种)?(?:数量)?(?:的)?(?:机厅|街机厅|游戏厅)?(?:是)?哪家|"
+        r"哪家(?:机厅|街机厅|游戏厅)?(?:的)?(?:机台|机器|机种)?(?:最多|最少)|"
+        r"(?:最多|最少|最大|最小|最高|最低)(?:机台|机器|机种|数量)?",
+        " ",
+        sanitized,
+    )
     parts = [part for part in _SPACE_RE.split(sanitized) if part]
     if not parts:
         return None
@@ -418,7 +426,7 @@ def _extract_region_hints(text: str) -> tuple[str | None, str | None, str | None
     county_name: str | None = None
 
     for alias, canonical in _CITY_ALIASES:
-        if alias in compact:
+        if alias in compact or canonical in compact:
             if canonical in _MUNICIPALITIES:
                 province_name = canonical
                 city_name = canonical

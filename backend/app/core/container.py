@@ -21,6 +21,7 @@ from app.agent.tools.mcp_gateway import MCPToolGateway, build_mcp_server_configs
 from app.agent.tools.registry import ToolRegistry
 from app.core.config import Settings
 from app.infra.db.local_store import LocalArcadeStore
+from app.infra.db.demo_data import build_demo_arcades
 from app.infra.db.repository import ArcadeRepository
 from app.infra.db.supabase_repository import SupabaseArcadeRepository, SupabaseRepositoryConfig
 from app.rag.service import LangChainRAGService
@@ -145,6 +146,8 @@ def build_container(settings: Settings) -> AppContainer:
         session_store=session_store,
         replay_buffer=replay_buffer,
         arcade_payload_mapper=arcade_payload_mapper,
+        store=store,
+        demo_mode=settings.demo_mode,
         max_steps=settings.agent_max_steps,
     )
     orchestrator = Orchestrator(
@@ -181,6 +184,8 @@ def build_container(settings: Settings) -> AppContainer:
 
 
 def _build_arcade_repository(settings: Settings) -> ArcadeRepository:
+    if settings.demo_mode:
+        return LocalArcadeStore.from_rows(build_demo_arcades())
     if settings.arcade_data_source == "jsonl":
         return LocalArcadeStore.from_jsonl(settings.data_jsonl_path)
 

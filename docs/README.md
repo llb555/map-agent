@@ -26,6 +26,8 @@
 15. [浏览器定位与逆地理编码](./dev-details/browser-location-reverse-geocoding.md)：定位、逆地理和 agent 上下文注入链路。
 16. [Agent Context Payload Design](./dev-details/agent-context-payload-design.md)：agent 上下文 payload 的结构和约束。
 17. [动态工具注册实现说明](./dev-details/dynamic-tool-registry-implementation.md)：builtin 与 MCP 工具注册链路。
+18. [RAG 测评系统](../backend/evaluation/README.md)：数据集规范、检索与答案指标、基线实验和 CI 质量门禁。
+19. [Hugging Face 配置](../backend/docs/HUGGINGFACE_SETUP.md)：模型、Token、缓存、离线模式、Docker 和测评配置。
 
 ## 公开边界
 

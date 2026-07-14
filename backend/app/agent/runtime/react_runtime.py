@@ -38,6 +38,7 @@ from app.protocol.messages import (
     MapViewPayloadDto,
 )
 from app.services.arcade_payload_mapper import ArcadePayloadMapper
+from app.infra.db.repository import ArcadeRepository
 
 logger = get_logger(__name__)
 
@@ -129,7 +130,9 @@ class ReactRuntime:
         session_store: SessionStateStore,
         replay_buffer: ReplayBuffer,
         arcade_payload_mapper: ArcadePayloadMapper,
+        store: ArcadeRepository,
         max_steps: int,
+        demo_mode: bool = False,
     ) -> None:
         self._context_builder = context_builder
         self._subagent_builder = subagent_builder
@@ -138,6 +141,8 @@ class ReactRuntime:
         self._session_store = session_store
         self._replay_buffer = replay_buffer
         self._arcade_payload_mapper = arcade_payload_mapper
+        self._store = store
+        self._demo_mode = demo_mode
         self._max_steps = max(2, max_steps)
 
     def prepare_session(self, session_id: str, *, client_id: str | None = None) -> None:
@@ -261,11 +266,14 @@ class ReactRuntime:
             reason="session.started",
         )
 
-        final_text = await self._run_main_agent(
-            request=request,
-            session_id=session_id,
-            state=state,
-        )
+        if self._demo_mode:
+            final_text = await self._run_demo_turn(request=request, session_id=session_id, state=state)
+        else:
+            final_text = await self._run_main_agent(
+                request=request,
+                session_id=session_id,
+                state=state,
+            )
 
         if not final_text:
             logger.warning(
@@ -314,6 +322,104 @@ class ReactRuntime:
             _short(final_text, limit=160),
         )
         return await self._build_response(session_id=session_id, state=state, final_text=final_text)
+
+    async def _run_demo_turn(
+        self, *, request: ChatRequest, session_id: str, state: AgentSessionState
+    ) -> str:
+        """Run a deterministic keyless turn through the normal map and SSE contracts."""
+        state.working_memory["degraded"] = True
+        state.working_memory["degradation_reason"] = "demo_mode_no_llm"
+        rewrite = rewrite_query(request.message)
+        origin_lng = request.location.lng if request.location is not None else None
+        origin_lat = request.location.lat if request.location is not None else None
+        sort_by = "distance" if request.location is not None else "updated_at"
+        rows: list[dict[str, Any]] = []
+
+        if _normalize_intent(state.intent) == "navigate" and request.shop_id is not None:
+            selected = self._store.get_shop(request.shop_id)
+            if selected is not None:
+                rows = [selected]
+        if not rows:
+            rows, _ = self._store.list_shops(
+                keyword=request.keyword,
+                shop_name=rewrite.shop_name,
+                title_name=rewrite.title_name,
+                province_code=request.province_code,
+                city_code=request.city_code,
+                county_code=request.county_code,
+                province_name=rewrite.province_name,
+                city_name=rewrite.city_name,
+                county_name=rewrite.county_name,
+                has_arcades=True,
+                page=1,
+                page_size=request.page_size,
+                sort_by=sort_by,
+                sort_order="asc" if sort_by == "distance" else "desc",
+                origin_lng=origin_lng,
+                origin_lat=origin_lat,
+                origin_coord_system="wgs84",
+            )
+        # Natural-language extraction is intentionally conservative; broaden to the
+        # supplied keyword, then the selected region so every demo remains useful.
+        if not rows and request.keyword:
+            rows, _ = self._store.list_shops(
+                keyword=request.keyword, province_code=request.province_code,
+                city_code=request.city_code, county_code=request.county_code,
+                has_arcades=True, page=1, page_size=request.page_size,
+            )
+        if not rows:
+            rows, _ = self._store.list_shops(
+                keyword=None, province_code=request.province_code,
+                city_code=request.city_code, county_code=request.county_code,
+                has_arcades=True, page=1, page_size=request.page_size,
+                sort_by=sort_by, sort_order="asc" if sort_by == "distance" else "desc",
+                origin_lng=origin_lng, origin_lat=origin_lat, origin_coord_system="wgs84",
+            )
+
+        set_working_memory_artifact(state.working_memory, "shops", rows)
+        set_working_memory_artifact(
+            state.working_memory,
+            "view_payload",
+            {"schema_version": 1, "scene": "agent_candidates", "title": "演示机厅搜索结果"},
+        )
+        self._replay_buffer.append(session_id, "tool.started", {
+            "tool": "demo_arcade_search", "call_id": f"demo_{state.turn_index}",
+            "active_subagent": "main_agent",
+        })
+        self._replay_buffer.append(session_id, "tool.completed", {
+            "tool": "demo_arcade_search", "call_id": f"demo_{state.turn_index}",
+            "active_subagent": "main_agent",
+        })
+
+        if _normalize_intent(state.intent) == "navigate" and rows:
+            destination = rows[0]
+            set_working_memory_artifact(state.working_memory, "destination", destination)
+            dest_lng = destination.get("longitude_gcj02")
+            dest_lat = destination.get("latitude_gcj02")
+            polyline: list[dict[str, Any]] = []
+            if origin_lng is not None and origin_lat is not None and dest_lng is not None and dest_lat is not None:
+                polyline = [
+                    {"lng": origin_lng, "lat": origin_lat, "coord_system": "wgs84", "source": "client", "precision": "exact"},
+                    {"lng": dest_lng, "lat": dest_lat, "coord_system": "gcj02", "source": "catalog", "precision": "exact"},
+                ]
+            route = {
+                "schema_version": 1, "provider": "none", "mode": "walking",
+                "origin": polyline[0] if polyline else None,
+                "destination": polyline[-1] if polyline else None,
+                "polyline": polyline,
+                "hint": "DEMO_MODE：外部地图服务不可用，展示离线路线降级结果。",
+            }
+            set_working_memory_artifact(state.working_memory, "route", route)
+            set_working_memory_artifact(state.working_memory, "view_payload", {
+                "schema_version": 1, "scene": "agent_route", "title": "离线演示路线",
+            })
+            self._replay_buffer.append(session_id, "navigation.route_ready", route)
+            return f"已为你准备到 {destination.get('name')} 的演示路线。当前无 LLM/地图 Key，已降级为离线路线展示。"
+
+        if rows:
+            names = "、".join(str(row.get("name") or "演示机厅") for row in rows[:3])
+            return f"找到 {len(rows)} 条合成演示结果：{names}。当前无 LLM Key，已使用确定性本地搜索降级。"
+        return "没有匹配的合成演示数据。当前无 LLM Key，已完成本地搜索降级。"
 
     async def _run_main_agent(
         self,
@@ -421,6 +527,19 @@ class ReactRuntime:
                     call.call_id,
                     hydrated_fields,
                 )
+            if call.name == "db_query_tool" and self._is_repeated_empty_db_query(
+                state=session_state,
+                arguments=prepared_args,
+            ):
+                session_state.working_memory["reply"] = self._empty_db_reply(
+                    session_state.working_memory
+                )
+                logger.info(
+                    "tool.call.skipped session_id=%s tool=%s reason=repeated_empty_query",
+                    session_id,
+                    call.name,
+                )
+                break
             self._replay_buffer.append(
                 session_id,
                 "tool.started",
@@ -469,6 +588,36 @@ class ReactRuntime:
                 tool_arguments=prepared_args,
                 persist=persist,
             )
+
+    def _is_repeated_empty_db_query(
+        self,
+        *,
+        state: AgentSessionState,
+        arguments: dict[str, Any],
+    ) -> bool:
+        for turn in reversed(state.turns):
+            if turn.role != "tool" or turn.name != "db_query_tool":
+                continue
+            payload = turn.payload if isinstance(turn.payload, dict) else {}
+            if payload.get("status") != "completed":
+                continue
+            previous_args = payload.get("arguments")
+            result = payload.get("result")
+            return (
+                isinstance(previous_args, dict)
+                and previous_args == arguments
+                and isinstance(result, dict)
+                and int(result.get("total") or 0) == 0
+            )
+        return False
+
+    def _empty_db_reply(self, memory: dict[str, Any]) -> str:
+        query = memory.get("last_db_query")
+        if isinstance(query, dict):
+            area = query.get("county_name") or query.get("city_name") or query.get("province_name")
+            if isinstance(area, str) and area.strip():
+                return f"当前结构化数据源中没有收录{area.strip()}的匹配机厅，暂时无法据此给出排名。"
+        return "当前结构化数据源中没有匹配的机厅，暂时无法据此给出排名。"
 
     async def _run_worker(
         self,

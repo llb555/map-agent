@@ -52,3 +52,11 @@ class ArcadeRepository(Protocol):
     def list_counties(self, city_code: str) -> list[dict[str, str]]:
         """Return county choices under a city code."""
         ...
+
+    def add_knowledge_shop(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist one reviewed knowledge candidate when supported."""
+        ...
+
+    def find_duplicate_shop(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """Find an existing shop matching a proposed candidate."""
+        ...

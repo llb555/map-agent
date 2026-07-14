@@ -23,6 +23,7 @@ QQ群：1091316877
 - Map: 高德 Web JS API, 高德 REST API, 高德 MCP endpoint
 - Data: JSONL 读模型、可选 Supabase 读模型、本地 JSON 会话存储
 - Tests: pytest, Playwright
+- Evaluation: Hit/Recall@K, MRR@K, MAP@K, nDCG@K, answer/citation scoring, quality gates
 
 ## 目录结构
 
@@ -115,6 +116,7 @@ Copy-Item backend/.env.example .env
 
 ```dotenv
 APP_ENV=dev
+DEMO_MODE=false
 LOG_LEVEL=INFO
 HOST=0.0.0.0
 PORT=8000
@@ -159,6 +161,14 @@ RAG_VECTOR_BACKEND=memory
 RAG_FAISS_INDEX_PATH=data/runtime/rag_index.faiss
 RAG_FAISS_METADATA_PATH=data/runtime/rag_index_meta.json
 
+# Hugging Face 本地模型；公开模型无需 Token
+HF_TOKEN=
+HUGGINGFACE_CACHE_DIR=data/runtime/huggingface
+HF_HUB_OFFLINE=false
+HUGGINGFACE_DEVICE=
+HUGGINGFACE_TRUST_REMOTE_CODE=false
+HUGGINGFACE_REVISION=
+
 AGENT_MAX_STEPS=20
 AGENT_CONTEXT_WINDOW=24
 AGENT_PROVIDER_PROFILE=default
@@ -181,11 +191,16 @@ ARCADE_GEO_REQUEST_TIMEOUT_SECONDS=1.2
 - `ARCADE_DATA_JSONL` 是 JSONL 模式读取的机厅数据源；公开仓库不包含真实数据，请指向你本地准备的兼容文件。
 - `ARCADE_DATA_SOURCE=supabase` 时必须配置 `SUPABASE_URL`，以及 `SUPABASE_ANON_KEY` 或 `SUPABASE_SERVICE_ROLE_KEY`。缺少配置会启动失败，不会静默回退 JSONL。
 - `SUPABASE_SERVICE_ROLE_KEY` 仅用于后端或导入脚本，不要暴露给浏览器端。
-- `LLM_API_KEY` 为空时服务可以启动，机厅列表接口也可使用，但 Agent 对话不会产生有意义的模型编排结果。API Key需要使用兼容OpenAI的接口，建议使用DeepSeek的API。
+- `DEMO_MODE=true` 会忽略外部机厅数据源，加载 60 条确定性合成数据；即使 `LLM_API_KEY` 和 `AMAP_API_KEY` 均为空，也可演示搜索、地图、SSE 流式事件及离线路线降级。`/health` 会返回 `demo_mode=true` 和 `degradation=deterministic_local_runtime`。
+- `DEMO_MODE=false` 且 `LLM_API_KEY` 为空时，服务和机厅列表仍可启动，但 Agent 对话无法完成模型编排。API Key 需兼容 OpenAI 接口。
 - `RAG_ENABLED=true` 后会启用 LangChain-backed 知识检索工具 `knowledge_search_tool`。`RAG_SOURCE_PATH` 支持目录或单文件，目录下会扫描 `.md`、`.txt`、`.json`、`.jsonl`、`.pdf`、`.docx`、`.doc`。
 - `RAG_SEMANTIC_CHUNKING_ENABLED=true` 时会优先尝试 `SemanticChunker` 做语义分块；若依赖不可用或分块失败，会自动回退到当前固定长度分块。
 - `RAG_EMBEDDING_MODEL=local-hash-v1` 时会使用内置本地 embedding 回退，不依赖额外向量服务，适合先把 RAG 跑通。需要更好的语义效果时，再换成真实 embeddings API。
 - 如果想用本地真实 Transformer embedding，可以把 `RAG_EMBEDDING_MODEL` 设成 `sentence-transformers:<model-name>`，例如 `sentence-transformers:BAAI/bge-small-zh-v1.5`。
+- `sentence-transformers:*` 默认从 Hugging Face Hub 下载到 `HUGGINGFACE_CACHE_DIR`。公共模型无需 `HF_TOKEN`；私有或 gated 模型才需要把只读 Token 写入本机 `.env`。
+- `HF_HUB_OFFLINE=true` 会禁止联网并只读取缓存，适合生产稳定启动；第一次准备模型时应保持为 `false`，下载完成后再切换离线模式。
+- `HUGGINGFACE_DEVICE` 可设为 `cpu`、`cuda` 或 `mps`，留空时由 PyTorch 自动选择。`HUGGINGFACE_TRUST_REMOTE_CODE` 默认关闭，只有确认模型仓库代码可信时才开启。
+- `HUGGINGFACE_REVISION` 可锁定模型 commit/tag；生产环境建议使用 commit SHA，避免同名模型更新导致评测和索引漂移。
 - 若使用外部 embeddings API，`RAG_EMBEDDING_BASE_URL`、`RAG_EMBEDDING_API_KEY` 为空时会分别回退到 `LLM_BASE_URL`、`LLM_API_KEY`。
 - `RAG_VECTOR_BACKEND` 默认是 `memory`；设成 `faiss` 后会把知识库向量索引持久化到本地文件。
 - `RAG_FAISS_INDEX_PATH` 保存 `.faiss` 索引，`RAG_FAISS_METADATA_PATH` 保存 metadata sidecar。知识库上传/删除会进入后台增量索引队列，按文件状态追踪 `pending` / `indexing` / `ready` / `failed`，并复用未变化 Chunk 的 embedding。
@@ -294,7 +309,7 @@ VITE_AMAP_URI_SRC=arcadegent_web
 1. 在 Supabase 控制台开启 Email 登录；根据需要决定是否要求邮箱确认。
 2. 将项目 URL 和 anon key 同时配置到 `SUPABASE_*` 与 `VITE_SUPABASE_*`。
 3. 确认 JWKS 地址可访问后，将 `AUTH_ENABLED` 改为 `true`。
-4. 重新启动后端并重新构建前端。只配置 `VITE_SUPABASE_*` 会显示登录页，但后端不会启用保护；生产环境必须同时开启 `AUTH_ENABLED=true`。
+4. 重新启动后端并重新构建前端。只配置 `VITE_SUPABASE_*` 会显示登录页，但后端不会启用保护；`APP_ENV=production` 时后端会强制要求 `AUTH_ENABLED=true`，并校验 issuer、audience、算法及验签密钥配置，缺失任一项都会拒绝启动。
 
 开启后，聊天和 SSE 接口必须携带 `Authorization: Bearer <token>`，会话归属以 JWT 的 `sub` 为准，客户端提交的 `client_id` 不参与授权。知识库读取仍可用，但上传、删除、重建索引要求 JWT 中的 `app_metadata.role` 为 `admin`。
 
@@ -591,6 +606,22 @@ npm run test:e2e:golden
 
 详细说明见 `docs/dev-details/agent-regression-and-drills.md`。
 
+RAG 测评与质量门禁：
+
+```bash
+backend/.venv/bin/python backend/scripts/evaluate_rag.py \
+  --dataset backend/evaluation/datasets/arcadegent_demo_v2.json \
+  --source-path backend/evaluation/fixtures/knowledge \
+  --embedding-model local-hash-v1 \
+  --top-k 5 \
+  --cutoffs 1,3,5 \
+  --fail-on-gate
+```
+
+评测系统支持检索、上下文事实、答案、引用、可选 LLM Judge、标签切片、延迟、基线对比和 CI 门禁。完整的数据集格式与实验方法见 [`backend/evaluation/README.md`](backend/evaluation/README.md)。
+
+Hugging Face 中文模型、缓存和离线部署见 [`backend/docs/HUGGINGFACE_SETUP.md`](backend/docs/HUGGINGFACE_SETUP.md)。
+
 ## 故障排查
 
 - 后端启动但无数据：检查 `ARCADE_DATA_JSONL` 是否存在，或访问 `/health` 看 `store` 状态。
@@ -603,7 +634,7 @@ npm run test:e2e:golden
 
 ## 当前限制
 
-- 线上级认证、多用户隔离和权限管理尚未接入。
+- JWT 认证、会话用户隔离和知识库管理员权限已接入；更细粒度的 RBAC 与组织级权限模型尚未实现。
 - 公开仓库不附带真实数据集；本地体验完整检索能力需要自行准备兼容数据源。
 - MCP discovery 依赖第三方服务返回的 tool schema，远端命名变化时可能需要手动指定 `route_tool_name`。
 - 没有高德 Web JS key 时，前端仍可列表检索并生成高德跳转 URI，但内嵌地图不可用。

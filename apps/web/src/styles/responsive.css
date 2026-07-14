@@ -230,6 +230,11 @@
     display: grid;
   }
 
+  .knowledge-candidate-search,
+  .knowledge-candidate-item {
+    grid-template-columns: 1fr;
+  }
+
   .knowledge-selection-pill,
   .knowledge-delete-btn {
     justify-self: start;

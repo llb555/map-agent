@@ -322,6 +322,12 @@ export type KnowledgeLookupResponse = Omit<KnowledgeLookupResponseDto, "total_hi
   arcade_candidates: KnowledgeArcadeCandidate[];
 };
 
+export type KnowledgeArcadePromotionResponse = {
+  status: "created";
+  source_id: number;
+  name: string;
+};
+
 export type {
   ChatStreamEnvelope,
   ChatStreamEventName

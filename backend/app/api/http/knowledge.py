@@ -34,6 +34,16 @@ class KnowledgeRetryRequest(BaseModel):
     relative_path: str = Field(..., min_length=1)
 
 
+class KnowledgeArcadePromotionRequest(BaseModel):
+    candidate: KnowledgeArcadeCandidateDto
+
+
+class KnowledgeArcadePromotionResponse(BaseModel):
+    status: Literal["created"]
+    source_id: int
+    name: str
+
+
 class KnowledgeSubmissionDto(BaseModel):
     id: str
     owner_user_id: str
@@ -271,6 +281,51 @@ def lookup_knowledge(
         total_hits=int(result.get("total_hits") or len(hits)),
         hits=hits,
         arcade_candidates=candidates,
+    )
+
+
+@router.post("/arcade-candidates/promote", response_model=KnowledgeArcadePromotionResponse, status_code=201)
+def promote_knowledge_arcade_candidate(
+    payload: KnowledgeArcadePromotionRequest,
+    container: AppContainer = Depends(get_container),
+    _: CurrentUser = Depends(require_admin),
+) -> KnowledgeArcadePromotionResponse:
+    candidate = payload.candidate
+    gcj = candidate.geo.gcj02 if candidate.geo is not None else None
+    wgs = candidate.geo.wgs84 if candidate.geo is not None else None
+    proposed = {
+        "name": candidate.name.strip(),
+        "address": candidate.address,
+        "transport": candidate.transport,
+        "province_name": candidate.province_name,
+        "city_name": candidate.city_name,
+        "county_name": candidate.county_name,
+        "longitude_gcj02": gcj.lng if gcj is not None else None,
+        "latitude_gcj02": gcj.lat if gcj is not None else None,
+        "longitude_wgs84": wgs.lng if wgs is not None else None,
+        "latitude_wgs84": wgs.lat if wgs is not None else None,
+        "source_url": candidate.source_uri or candidate.id,
+        "comment": f"由知识库候选审核入库；来源：{candidate.source_uri or candidate.id}",
+        "arcades": [],
+    }
+    if not proposed["name"] or not (proposed["address"] or proposed["city_name"] or proposed["province_name"]):
+        raise HTTPException(status_code=400, detail="knowledge_arcade_candidate_incomplete")
+    duplicate = container.store.find_duplicate_shop(proposed)
+    if duplicate is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"knowledge_arcade_candidate_duplicate:{duplicate.get('source_id')}",
+        )
+    try:
+        created = container.store.add_knowledge_shop(proposed)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return KnowledgeArcadePromotionResponse(
+        status="created",
+        source_id=int(created["source_id"]),
+        name=str(created["name"]),
     )
 
 

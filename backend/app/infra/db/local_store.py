@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -312,9 +314,11 @@ def _normalize_region_name(value: str | None) -> str:
 class LocalArcadeStore:
     """Read-optimized in-memory store built from the configured arcade JSONL."""
 
-    def __init__(self, shops: list[dict[str, Any]], stats: LoadStats) -> None:
+    def __init__(self, shops: list[dict[str, Any]], stats: LoadStats, source_path: Path | None = None) -> None:
         self._shops = shops
         self._stats = stats
+        self._source_path = source_path
+        self._write_lock = threading.Lock()
         self._by_source_id = {int(item["source_id"]): item for item in shops}
         self._provinces = self._build_province_index(shops)
         self._cities = self._build_city_index(shops)
@@ -358,7 +362,22 @@ class LocalArcadeStore:
         return cls(
             ordered,
             stats=LoadStats(total_lines=total, loaded_rows=len(ordered), bad_lines=bad_lines),
+            source_path=path,
         )
+
+    @classmethod
+    def from_rows(cls, rows: list[dict[str, Any]]) -> "LocalArcadeStore":
+        """Create a store from in-memory rows, primarily for deterministic demos."""
+        shops: list[dict[str, Any]] = []
+        for index, payload in enumerate(rows, start=1):
+            normalized = cls._normalize_shop(payload)
+            if normalized is None:
+                continue
+            normalized["_search_blob"] = _build_search_blob(normalized)
+            normalized["_load_line"] = index
+            shops.append(normalized)
+        shops.sort(key=lambda item: (str(item.get("updated_at") or ""), item["source_id"]), reverse=True)
+        return cls(shops, LoadStats(total_lines=len(rows), loaded_rows=len(shops), bad_lines=len(rows) - len(shops)))
 
     @staticmethod
     def _normalize_shop(raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -470,6 +489,67 @@ class LocalArcadeStore:
             "loaded_rows": self._stats.loaded_rows,
             "bad_lines": self._stats.bad_lines,
         }
+
+    def add_knowledge_shop(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Persist one reviewed knowledge candidate and refresh in-memory indexes."""
+        if self._source_path is None:
+            raise RuntimeError("arcade_store_not_writable")
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise ValueError("arcade_name_required")
+        with self._write_lock:
+            duplicate = self.find_duplicate_shop(payload)
+            if duplicate is not None:
+                raise ValueError(f"arcade_duplicate:{duplicate['source_id']}")
+            source_id = max((int(row.get("source_id") or 0) for row in self._shops), default=0) + 1
+            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            row = {
+                "source": "knowledge",
+                "source_id": source_id,
+                "source_url": str(payload.get("source_url") or f"knowledge://promoted/{source_id}"),
+                "name": name,
+                "address": payload.get("address"),
+                "transport": payload.get("transport"),
+                "province_name": payload.get("province_name"),
+                "city_name": payload.get("city_name"),
+                "county_name": payload.get("county_name"),
+                "longitude_gcj02": payload.get("longitude_gcj02"),
+                "latitude_gcj02": payload.get("latitude_gcj02"),
+                "longitude_wgs84": payload.get("longitude_wgs84"),
+                "latitude_wgs84": payload.get("latitude_wgs84"),
+                "comment": payload.get("comment"),
+                "created_at": now,
+                "updated_at": now,
+                "arcades": payload.get("arcades") if isinstance(payload.get("arcades"), list) else [],
+            }
+            raw_rows = [dict(item.get("raw") or {}) for item in self._shops]
+            raw_rows.append(row)
+            temp_path = self._source_path.with_suffix(self._source_path.suffix + ".tmp")
+            temp_path.write_text(
+                "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in raw_rows),
+                encoding="utf-8",
+            )
+            temp_path.replace(self._source_path)
+            refreshed = type(self).from_jsonl(self._source_path)
+            self._shops = refreshed._shops
+            self._stats = refreshed._stats
+            self._by_source_id = refreshed._by_source_id
+            self._provinces = refreshed._provinces
+            self._cities = refreshed._cities
+            self._counties = refreshed._counties
+            return dict(self._by_source_id[source_id])
+
+    def find_duplicate_shop(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        name = re.sub(r"\s+", "", str(payload.get("name") or "")).lower()
+        address = re.sub(r"\s+", "", str(payload.get("address") or "")).lower()
+        for row in self._shops:
+            row_name = re.sub(r"\s+", "", str(row.get("name") or "")).lower()
+            row_address = re.sub(r"\s+", "", str(row.get("address") or "")).lower()
+            if name and row_name == name:
+                return row
+            if address and row_address == address:
+                return row
+        return None
 
     def list_shops(
         self,

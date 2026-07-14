@@ -11,6 +11,8 @@ import type {
   KnowledgeStatus,
   KnowledgeUploadResponse,
   KnowledgeSubmission,
+  KnowledgeArcadeCandidate,
+  KnowledgeArcadePromotionResponse,
   CurrentUser,
   ReverseGeocodeRequest,
   ReverseGeocodeResponse,
@@ -413,6 +415,12 @@ export async function reviewKnowledgeSubmission(
 
 export async function lookupKnowledge(query: string, topK = 3, options?: RequestOptions): Promise<KnowledgeLookupResponse> {
   return fetchJson<KnowledgeLookupResponse>(buildUrl("/api/knowledge/lookup", { q: query, top_k: topK }), options);
+}
+
+export async function promoteKnowledgeArcadeCandidate(
+  candidate: KnowledgeArcadeCandidate
+): Promise<KnowledgeArcadePromotionResponse> {
+  return postJson<KnowledgeArcadePromotionResponse>("/api/knowledge/arcade-candidates/promote", { candidate });
 }
 
 export async function reindexKnowledge(): Promise<KnowledgeStatus> {

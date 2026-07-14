@@ -310,6 +310,7 @@ def test_knowledge_upload_and_reindex(tmp_path: Path) -> None:
     knowledge_dir = tmp_path.resolve() / "knowledge-upload"
     client = _build_client(
         tmp_path,
+        auth_env=_test_auth_env(),
         rag_env={
             "RAG_ENABLED": "true",
             "RAG_SOURCE_PATH": str(knowledge_dir),
@@ -323,6 +324,7 @@ def test_knowledge_upload_and_reindex(tmp_path: Path) -> None:
 
     upload = client.post(
         "/api/knowledge/upload",
+        headers=_auth_headers("admin-a", role="admin"),
         files={"file": ("guide.md", b"# FAQ\n\nmaimai rules and hotel notes", "text/markdown")},
     )
     assert upload.status_code == 200
@@ -336,7 +338,10 @@ def test_knowledge_upload_and_reindex(tmp_path: Path) -> None:
     assert guide["status"] == "ready"
     assert guide["chunk_count"] >= 1
 
-    reindex = client.post("/api/knowledge/reindex")
+    reindex = client.post(
+        "/api/knowledge/reindex",
+        headers=_auth_headers("admin-a", role="admin"),
+    )
     assert reindex.status_code == 200
     ready_after_reindex = _wait_for_knowledge_ready(client)
     assert ready_after_reindex["index_ready"] is True
@@ -371,6 +376,7 @@ def test_knowledge_delete_file_and_refresh_status(tmp_path: Path) -> None:
     knowledge_dir = tmp_path.resolve() / "knowledge-delete"
     client = _build_client(
         tmp_path,
+        auth_env=_test_auth_env(),
         rag_env={
             "RAG_ENABLED": "true",
             "RAG_SOURCE_PATH": str(knowledge_dir),
@@ -380,13 +386,18 @@ def test_knowledge_delete_file_and_refresh_status(tmp_path: Path) -> None:
 
     upload = client.post(
         "/api/knowledge/upload",
+        headers=_auth_headers("admin-a", role="admin"),
         files={"file": ("delete-me.md", b"# Temp\n\nremove this file", "text/markdown")},
     )
     assert upload.status_code == 200
     _wait_for_knowledge_ready(client)
     assert (knowledge_dir / "delete-me.md").exists()
 
-    delete_resp = client.delete("/api/knowledge/files", params={"relative_path": "delete-me.md"})
+    delete_resp = client.delete(
+        "/api/knowledge/files",
+        headers=_auth_headers("admin-a", role="admin"),
+        params={"relative_path": "delete-me.md"},
+    )
     assert delete_resp.status_code == 204
     assert not (knowledge_dir / "delete-me.md").exists()
 
@@ -398,6 +409,7 @@ def test_knowledge_batch_delete_files_and_refresh_status(tmp_path: Path) -> None
     knowledge_dir = tmp_path.resolve() / "knowledge-batch-delete"
     client = _build_client(
         tmp_path,
+        auth_env=_test_auth_env(),
         rag_env={
             "RAG_ENABLED": "true",
             "RAG_SOURCE_PATH": str(knowledge_dir),
@@ -407,10 +419,12 @@ def test_knowledge_batch_delete_files_and_refresh_status(tmp_path: Path) -> None
 
     first = client.post(
         "/api/knowledge/upload",
+        headers=_auth_headers("admin-a", role="admin"),
         files={"file": ("first.md", b"# First\n\nalpha", "text/markdown")},
     )
     second = client.post(
         "/api/knowledge/upload",
+        headers=_auth_headers("admin-a", role="admin"),
         files={"file": ("second.md", b"# Second\n\nbeta", "text/markdown")},
     )
     assert first.status_code == 200
@@ -421,6 +435,7 @@ def test_knowledge_batch_delete_files_and_refresh_status(tmp_path: Path) -> None
 
     batch_delete = client.post(
         "/api/knowledge/files/delete-batch",
+        headers=_auth_headers("admin-a", role="admin"),
         json={"relative_paths": ["first.md", "second.md"]},
     )
     assert batch_delete.status_code == 200
@@ -1153,6 +1168,15 @@ def test_jwt_rejects_invalid_token_and_limits_knowledge_writes_to_admin(tmp_path
         headers=_auth_headers("admin-a", role="admin"),
     )
     assert admin_reindex.status_code == 200
+
+
+def test_knowledge_admin_endpoint_denies_when_auth_is_disabled(tmp_path: Path) -> None:
+    client = _build_client(tmp_path)
+
+    response = client.post("/api/knowledge/reindex")
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "authentication_required"}
 
 
 def test_knowledge_submission_review_and_publish_flow(tmp_path: Path) -> None:

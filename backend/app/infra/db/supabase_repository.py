@@ -125,6 +125,17 @@ class SupabaseArcadeRepository:
             raise RuntimeError("supabase_rpc_invalid_response:arcadegent_get_shop")
         return payload
 
+    def add_knowledge_shop(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("arcade_write_not_supported_for_supabase")
+
+    def find_duplicate_shop(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        rows, _ = self.list_shops(
+            keyword=None, shop_name=str(payload.get("name") or ""), title_name=None,
+            province_code=None, city_code=None, county_code=None, has_arcades=None,
+            page=1, page_size=5,
+        )
+        return rows[0] if rows else None
+
     def list_provinces(self) -> list[dict[str, str]]:
         return self._list_regions(level="province", parent_code=None)
 

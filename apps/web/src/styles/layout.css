@@ -906,6 +906,59 @@
   font-size: 0.9rem;
 }
 
+.knowledge-candidate-workbench {
+  margin-top: 16px;
+}
+
+.knowledge-candidate-search {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.knowledge-candidate-search input {
+  min-height: 42px;
+  min-width: 0;
+  border: 1px solid rgba(105, 132, 122, 0.35);
+  border-radius: 4px;
+  background: #fff;
+  padding: 0 12px;
+  color: var(--ink);
+}
+
+.knowledge-candidate-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.knowledge-candidate-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  border-top: 1px solid rgba(105, 132, 122, 0.18);
+  padding: 12px 0;
+}
+
+.knowledge-candidate-item > div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.knowledge-candidate-item p {
+  margin: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.knowledge-candidate-item small {
+  color: #73847e;
+  overflow-wrap: anywhere;
+}
+
 .knowledge-error {
   background: #fff1ed;
   color: #9c3a2c;

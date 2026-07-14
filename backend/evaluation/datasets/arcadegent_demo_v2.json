@@ -1,0 +1,56 @@
+{
+  "name": "arcadegent-public-demo",
+  "version": "2.0.0",
+  "description": "Public deterministic smoke benchmark covering reviews, FAQ and answer policy.",
+  "cases": [
+    {
+      "id": "gamma_maintenance",
+      "query": "Gamma Arcade 的机器维护好吗",
+      "tags": ["review", "maintenance"],
+      "relevant_documents": [{"title": "Gamma Arcade 评论摘录", "source_uri": "knowledge://shops/gamma", "relevance": 3}],
+      "expected_context_facts": [{"accepted": ["维护状态比较稳定", "维护比较稳定"], "contradictions": ["维护状态不稳定", "并非维护状态比较稳定"]}],
+      "required_answer_facts": [{"accepted": ["维护状态比较稳定", "维护比较稳定"], "contradictions": ["维护状态不稳定", "并非维护状态比较稳定"]}],
+      "forbidden_answer_claims": ["完全不需要排队"]
+    },
+    {
+      "id": "gamma_queue",
+      "query": "Gamma Arcade 周末晚上排队吗",
+      "tags": ["review", "queue"],
+      "relevant_documents": [{"title": "Gamma Arcade 评论摘录", "source_uri": "knowledge://shops/gamma", "relevance": 3}],
+      "expected_context_facts": ["周末晚上排队会更明显"],
+      "required_answer_facts": ["周末晚上排队会更明显"]
+    },
+    {
+      "id": "bravo_sdvx",
+      "query": "Bravo Arcade 的 SDVX 手感和练习时间",
+      "tags": ["review", "sdvx"],
+      "relevant_documents": [{"title": "Bravo Arcade SDVX 指南", "source_uri": "knowledge://shops/bravo", "relevance": 3}],
+      "expected_context_facts": ["按键手感不错", "工作日下午较安静"],
+      "required_answer_facts": ["按键手感不错", "工作日下午较安静"]
+    },
+    {
+      "id": "distance_definition",
+      "query": "附近推荐显示的是导航距离吗",
+      "tags": ["faq", "distance"],
+      "relevant_documents": [{"title": "附近距离说明", "source_uri": "knowledge://faq/distance", "relevance": 3}],
+      "expected_context_facts": ["不等于实际导航距离"],
+      "required_answer_facts": ["不等于实际导航距离"]
+    },
+    {
+      "id": "price_discount",
+      "query": "单次价格包含会员和团购折扣吗",
+      "tags": ["faq", "price"],
+      "relevant_documents": [{"title": "价格计算说明", "source_uri": "knowledge://faq/price", "relevance": 3}],
+      "expected_context_facts": ["不包含团购、会员或活动折扣"],
+      "required_answer_facts": ["不包含团购、会员或活动折扣"]
+    },
+    {
+      "id": "review_policy",
+      "query": "回答机厅评论时可以编造主观评价吗",
+      "tags": ["policy", "safety"],
+      "relevant_documents": [{"title": "评论回答规范", "source_uri": "knowledge://policy/reviews", "relevance": 3}],
+      "expected_context_facts": ["不要把结构化字段扩写成未经证实的主观评价"],
+      "required_answer_facts": ["不要把结构化字段扩写成未经证实的主观评价"]
+    }
+  ]
+}

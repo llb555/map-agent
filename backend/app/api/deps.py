@@ -38,8 +38,10 @@ def get_current_user(
         ) from exc
 
 
-def require_admin(user: CurrentUser | None = Depends(get_current_user)) -> CurrentUser | None:
-    if user is not None and not user.is_admin:
+def require_admin(user: CurrentUser | None = Depends(get_current_user)) -> CurrentUser:
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication_required")
+    if not user.is_admin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="admin_required")
     return user
 

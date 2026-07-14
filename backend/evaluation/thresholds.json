@@ -1,0 +1,44 @@
+{
+  "minimums": {
+    "retrieval.completed_rate": 1.0,
+    "retrieval.metrics.hit_rate@1": 0.5,
+    "retrieval.metrics.hit_rate@{k}": 0.9,
+    "retrieval.metrics.reciprocal_rank@{k}": 0.65,
+    "retrieval.metrics.context_fact_recall": 0.8,
+    "tool.success_rate": 1.0,
+    "tool.expected_hit_behavior_rate": 0.9
+  },
+  "maximums": {
+    "retrieval.latency_ms.p95": 2000
+  },
+  "conditional": {
+    "answers": {
+      "minimums": {
+        "answers.metrics.prediction_coverage": 1.0,
+        "answers.metrics.required_fact_recall": 0.8,
+        "answers.metrics.forbidden_claim_avoidance": 1.0,
+        "answers.metrics.citation_precision": 0.8,
+        "answers.metrics.citation_recall": 0.8
+      }
+    },
+    "generation": {
+      "minimums": {
+        "generation.completed_rate": 1.0
+      }
+    },
+    "llm_judge": {
+      "minimums": {
+        "llm_judge.completed_rate": 1.0,
+        "llm_judge.metrics.faithfulness": 0.8,
+        "llm_judge.metrics.answer_relevance": 0.8,
+        "llm_judge.metrics.correctness": 0.8
+      }
+    }
+  },
+  "regression_metrics": [
+    "retrieval.metrics.hit_rate@1",
+    "retrieval.metrics.hit_rate@{k}",
+    "retrieval.metrics.reciprocal_rank@{k}",
+    "retrieval.metrics.ndcg@{k}"
+  ]
+}

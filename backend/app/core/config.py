@@ -75,6 +75,7 @@ class Settings:
     app_name: str = "Arcadegent Agent API"
     app_version: str = "0.1.0"
     env: str = "dev"
+    demo_mode: bool = False
     log_level: str = "INFO"
     host: str = "0.0.0.0"
     port: int = 8000
@@ -138,6 +139,12 @@ class Settings:
     rag_query_cache_max_entries: int = 128
     rag_query_cache_ttl_seconds: float = 120.0
     rag_snapshot_path: Path = Path("data/runtime/rag_snapshot.json")
+    huggingface_token: str = ""
+    huggingface_cache_dir: Path = Path("data/runtime/huggingface")
+    huggingface_offline: bool = False
+    huggingface_device: str = ""
+    huggingface_trust_remote_code: bool = False
+    huggingface_revision: str = ""
     agent_max_steps: int = 20
     agent_context_window: int = 24
     agent_nodes_definitions_dir: Path = Path("app/agent/nodes/definitions")
@@ -157,6 +164,25 @@ class Settings:
     arcade_geo_flush_interval_seconds: float = 0.5
     chat_session_flush_interval_seconds: float = 0.5
 
+    def validate_security(self) -> None:
+        """Reject insecure or incomplete authentication settings before startup."""
+        if self.env.strip().lower() in {"prod", "production"} and not self.auth_enabled:
+            raise ValueError("production_requires_auth_enabled")
+        if not self.auth_enabled:
+            return
+
+        missing: list[str] = []
+        if not self.jwt_issuer:
+            missing.append("JWT_ISSUER")
+        if not self.jwt_audience:
+            missing.append("JWT_AUDIENCE")
+        if not self.jwt_algorithms:
+            missing.append("JWT_ALGORITHMS")
+        if not self.jwt_secret and not self.jwt_jwks_url:
+            missing.append("JWT_SECRET_OR_JWT_JWKS_URL")
+        if missing:
+            raise ValueError(f"incomplete_auth_configuration:{','.join(missing)}")
+
     @classmethod
     def from_env(cls) -> "Settings":
         """Create settings from process env with deterministic defaults."""
@@ -167,10 +193,11 @@ class Settings:
         rag_vector_backend = os.getenv("RAG_VECTOR_BACKEND", cls.rag_vector_backend).strip().lower()
         if rag_vector_backend not in {"memory", "faiss"}:
             raise ValueError(f"invalid_rag_vector_backend:{rag_vector_backend}")
-        return cls(
+        settings = cls(
             app_name=os.getenv("APP_NAME", cls.app_name),
             app_version=os.getenv("APP_VERSION", cls.app_version),
             env=os.getenv("APP_ENV", cls.env),
+            demo_mode=_env_bool("DEMO_MODE", cls.demo_mode),
             log_level=os.getenv("LOG_LEVEL", cls.log_level),
             host=os.getenv("HOST", cls.host),
             port=int(os.getenv("PORT", str(cls.port))),
@@ -309,6 +336,20 @@ class Settings:
             rag_snapshot_path=_resolve_project_path(
                 os.getenv("RAG_SNAPSHOT_PATH", str(cls.rag_snapshot_path))
             ),
+            huggingface_token=os.getenv("HF_TOKEN", cls.huggingface_token).strip(),
+            huggingface_cache_dir=_resolve_project_path(
+                os.getenv("HUGGINGFACE_CACHE_DIR")
+                or os.getenv("HF_HOME")
+                or str(cls.huggingface_cache_dir)
+            ),
+            huggingface_offline=_env_bool("HF_HUB_OFFLINE", cls.huggingface_offline),
+            huggingface_device=os.getenv("HUGGINGFACE_DEVICE", cls.huggingface_device).strip(),
+            huggingface_trust_remote_code=_env_bool(
+                "HUGGINGFACE_TRUST_REMOTE_CODE", cls.huggingface_trust_remote_code
+            ),
+            huggingface_revision=os.getenv(
+                "HUGGINGFACE_REVISION", cls.huggingface_revision
+            ).strip(),
             agent_max_steps=int(
                 os.getenv("AGENT_MAX_STEPS", str(cls.agent_max_steps))
             ),
@@ -377,3 +418,5 @@ class Settings:
                 )
             ),
         )
+        settings.validate_security()
+        return settings

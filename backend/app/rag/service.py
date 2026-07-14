@@ -218,7 +218,17 @@ class LocalHashEmbeddings:
 class SentenceTransformerEmbeddings:
     """Local embeddings backed by sentence-transformers models."""
 
-    def __init__(self, *, model_name: str) -> None:
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        cache_dir: Path | None = None,
+        token: str = "",
+        device: str = "",
+        offline: bool = False,
+        trust_remote_code: bool = False,
+        revision: str = "",
+    ) -> None:
         self._model_name = model_name.strip()
         if not self._model_name:
             raise RuntimeError("sentence_transformer_model_required")
@@ -228,10 +238,26 @@ class SentenceTransformerEmbeddings:
             raise RuntimeError(
                 "sentence_transformers_missing: install sentence-transformers and its runtime dependencies"
             ) from exc
+        kwargs: dict[str, Any] = {
+            "local_files_only": bool(offline),
+            "trust_remote_code": bool(trust_remote_code),
+        }
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            kwargs["cache_folder"] = str(cache_dir)
+        if token:
+            kwargs["token"] = token
+        if device:
+            kwargs["device"] = device
+        if revision:
+            kwargs["revision"] = revision
         try:
-            self._model = SentenceTransformer(self._model_name, local_files_only=True)
-        except Exception:
-            self._model = SentenceTransformer(self._model_name)
+            self._model = SentenceTransformer(self._model_name, **kwargs)
+        except Exception as exc:
+            mode = "offline" if offline else "online"
+            raise RuntimeError(
+                f"sentence_transformer_load_failed:{self._model_name}:{mode}:{exc}"
+            ) from exc
 
     @property
     def enabled(self) -> bool:
@@ -335,7 +361,17 @@ class BaseReranker:
 class SentenceTransformerReranker(BaseReranker):
     """Reranker using sentence-transformers cross-encoder models."""
 
-    def __init__(self, *, model_name: str, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        timeout_seconds: float,
+        cache_dir: Path | None = None,
+        device: str = "",
+        offline: bool = False,
+        trust_remote_code: bool = False,
+        revision: str = "",
+    ) -> None:
         self._model_name = model_name.strip()
         self._timeout_seconds = max(1.0, float(timeout_seconds))
         if not self._model_name:
@@ -346,10 +382,24 @@ class SentenceTransformerReranker(BaseReranker):
             raise RuntimeError(
                 "sentence_transformers_missing: install sentence-transformers for reranking support"
             ) from exc
+        kwargs: dict[str, Any] = {
+            "local_files_only": bool(offline),
+            "trust_remote_code": bool(trust_remote_code),
+        }
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            kwargs["cache_dir"] = str(cache_dir)
+        if device:
+            kwargs["device"] = device
+        if revision:
+            kwargs["revision"] = revision
         try:
-            self._model = CrossEncoder(self._model_name)
-        except Exception:
-            self._model = CrossEncoder(self._model_name, local_files_only=True)
+            self._model = CrossEncoder(self._model_name, **kwargs)
+        except Exception as exc:
+            mode = "offline" if offline else "online"
+            raise RuntimeError(
+                f"sentence_transformer_reranker_load_failed:{self._model_name}:{mode}:{exc}"
+            ) from exc
 
     @property
     def enabled(self) -> bool:
@@ -413,10 +463,19 @@ class KeywordReranker(BaseReranker):
 class LangChainRAGService:
     """Build and query a LangChain-prepared in-memory knowledge index."""
 
-    def __init__(self, *, settings: Settings, project_root: Path) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        project_root: Path,
+        excluded_source_paths: set[Path] | None = None,
+    ) -> None:
         self._project_root = project_root
         self._enabled = bool(settings.rag_enabled)
         self._source_path = self._resolve_source_path(project_root=project_root, source_path=settings.rag_source_path)
+        self._excluded_source_paths = {
+            path.resolve() for path in (excluded_source_paths or set())
+        }
         self._chunk_size = max(200, int(settings.rag_chunk_size))
         self._chunk_overlap = max(0, min(int(settings.rag_chunk_overlap), self._chunk_size // 2))
         self._semantic_chunking_enabled = bool(settings.rag_semantic_chunking_enabled)
@@ -425,11 +484,25 @@ class LangChainRAGService:
         self._faiss_index_path = settings.rag_faiss_index_path
         self._faiss_metadata_path = settings.rag_faiss_metadata_path
         rag_embedding_model = settings.rag_embedding_model.strip()
-        if rag_embedding_model.lower() == "local-hash-v1":
+        if not self._enabled:
+            # Disabled RAG must not eagerly download or load heavyweight local models.
+            self._embedder = OpenAICompatibleEmbeddings(
+                api_key="",
+                base_url="",
+                model="",
+                timeout_seconds=settings.rag_embedding_timeout_seconds,
+            )
+        elif rag_embedding_model.lower() == "local-hash-v1":
             self._embedder = LocalHashEmbeddings()
         elif rag_embedding_model.startswith("sentence-transformers:"):
             self._embedder = SentenceTransformerEmbeddings(
-                model_name=rag_embedding_model.split(":", 1)[1].strip()
+                model_name=rag_embedding_model.split(":", 1)[1].strip(),
+                cache_dir=settings.huggingface_cache_dir,
+                token=settings.huggingface_token,
+                device=settings.huggingface_device,
+                offline=settings.huggingface_offline,
+                trust_remote_code=settings.huggingface_trust_remote_code,
+                revision=settings.huggingface_revision,
             )
         else:
             self._embedder = OpenAICompatibleEmbeddings(
@@ -440,7 +513,7 @@ class LangChainRAGService:
             )
 
         # Initialize reranker
-        self._reranker_enabled = bool(settings.rag_reranker_enabled)
+        self._reranker_enabled = bool(settings.rag_reranker_enabled and self._enabled)
         self._reranker_multiplier = max(2, int(settings.rag_reranker_top_k_multiplier))
         rag_reranker_model = settings.rag_reranker_model.strip()
         if self._reranker_enabled and rag_reranker_model:
@@ -448,6 +521,11 @@ class LangChainRAGService:
                 self._reranker: BaseReranker | None = SentenceTransformerReranker(
                     model_name=rag_reranker_model.split(":", 1)[1].strip(),
                     timeout_seconds=settings.rag_reranker_timeout_seconds,
+                    cache_dir=settings.huggingface_cache_dir,
+                    device=settings.huggingface_device,
+                    offline=settings.huggingface_offline,
+                    trust_remote_code=settings.huggingface_trust_remote_code,
+                    revision=settings.huggingface_revision,
                 )
             else:
                 # Fallback to keyword-based reranker
@@ -463,6 +541,10 @@ class LangChainRAGService:
         self._query_cache_ttl_seconds = max(1.0, float(settings.rag_query_cache_ttl_seconds))
         self._snapshot_path = settings.rag_snapshot_path
         self._bm25_index: BM25Index | None = BM25Index() if self._hybrid_search_enabled else None
+        self._huggingface_cache_dir = settings.huggingface_cache_dir
+        self._huggingface_offline = settings.huggingface_offline
+        self._huggingface_device = settings.huggingface_device
+        self._huggingface_revision = settings.huggingface_revision
 
         self._lock = RLock()
         self._job_condition = Condition()
@@ -478,7 +560,12 @@ class LangChainRAGService:
         self._query_cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
         self._query_cache_hits = 0
         self._query_cache_misses = 0
-        self._rag_embedding_model_signature = settings.rag_embedding_model.strip()
+        revision = settings.huggingface_revision.strip() or "default"
+        self._rag_embedding_model_signature = (
+            f"{settings.rag_embedding_model.strip()}@{revision}"
+            if settings.rag_embedding_model.startswith("sentence-transformers:")
+            else settings.rag_embedding_model.strip()
+        )
 
     def health(self) -> dict[str, Any]:
         file_states = list(self._merged_file_states().values())
@@ -499,6 +586,10 @@ class LangChainRAGService:
             "semantic_chunking_enabled": self._semantic_chunking_enabled,
             "reranker_enabled": self._reranker_enabled,
             "reranker_configured": self._reranker is not None and self._reranker.enabled,
+            "huggingface_cache_dir": str(self._huggingface_cache_dir),
+            "huggingface_offline": self._huggingface_offline,
+            "huggingface_device": self._huggingface_device or "auto",
+            "huggingface_revision": self._huggingface_revision or "default",
             "hybrid_search_enabled": self._hybrid_search_enabled,
             "bm25_configured": self._bm25_index is not None,
             "query_cache_enabled": self._query_cache_enabled,
@@ -704,14 +795,16 @@ class LangChainRAGService:
         if not self._source_path.exists():
             return {}
         if self._source_path.is_file():
-            paths = [self._source_path]
+            paths = [] if self._source_path.resolve() in self._excluded_source_paths else [self._source_path]
             root = self._source_path.parent
         else:
             root = self._source_path
             paths = sorted(
                 path
                 for path in self._source_path.rglob("*")
-                if path.is_file() and path.suffix.lower() in self._supported_suffixes
+                if path.is_file()
+                and path.suffix.lower() in self._supported_suffixes
+                and path.resolve() not in self._excluded_source_paths
             )
         snapshots: dict[str, _SourceFileSnapshot] = {}
         for path in paths:
@@ -1640,14 +1733,16 @@ class LangChainRAGService:
             return []
 
         if self._source_path.is_file():
-            paths = [self._source_path]
+            paths = [] if self._source_path.resolve() in self._excluded_source_paths else [self._source_path]
             root = self._source_path.parent
         else:
             root = self._source_path
             paths = sorted(
                 path
                 for path in self._source_path.rglob("*")
-                if path.is_file() and path.suffix.lower() in self._supported_suffixes
+                if path.is_file()
+                and path.suffix.lower() in self._supported_suffixes
+                and path.resolve() not in self._excluded_source_paths
             )
 
         return self._load_documents_from_paths(paths=paths, root=root, document_cls=document_cls)
